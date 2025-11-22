@@ -5,6 +5,8 @@ Script simple para crear una instancia de GCP
 import argparse
 import json
 import os
+import secrets
+import string
 from google.cloud import compute_v1
 
 
@@ -96,7 +98,7 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
     
     instance.network_interfaces = [network_interface]
     
-    # Configurar metadata (SSH keys or startup script for password)
+    # Configurar metadata (SSH keys o startup script para password)
     metadata = compute_v1.Metadata()
     items = []
     if ssh_key:
@@ -105,18 +107,25 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
         metadata_item.value = ssh_key
         items.append(metadata_item)
 
+    # If no password provided, generate a random one for this instance
+    if not password:
+        alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
+        while True:
+            pw = ''.join(secrets.choice(alphabet) for _ in range(14))
+            if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                    and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
+                password = pw
+                break
+
     if password:
         # Build startup script to set password and enable password SSH auth
         startup = f"""#!/bin/bash
 set -e
 if id -u ubuntu >/dev/null 2>&1; then
-  echo "ubuntu:{password}" | chpasswd
+    echo "ubuntu:{password}" | chpasswd
 else
-  useradd -m -s /bin/bash ubuntu || true
-  echo "ubuntu:{password}" | chpasswd
-fi
-if id -u debian >/dev/null 2>&1; then
-  echo "debian:{password}" | chpasswd || true
+    useradd -m -s /bin/bash ubuntu || true
+    echo "ubuntu:{password}" | chpasswd
 fi
 sed -i 's/^#PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
 sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
@@ -189,10 +198,9 @@ systemctl restart sshd || service ssh restart || true
             else:
                 print("   No se pudo obtener la IP pública de la instancia.")
 
-            # Recommend primary username and alternates for SSH access
+            # Recommend primary username for SSH access
             username = 'ubuntu'
-            alt_usernames = ['debian']
-            return {"success": True, "name": safe_name, "public_ip": public_ip, "password": password, "username": username, "alt_usernames": alt_usernames}
+            return {"success": True, "name": safe_name, "public_ip": public_ip, "password": password, "username": username}
 
     except Exception as e:
         print(f"\n❌ Error al crear la instancia: {e}")

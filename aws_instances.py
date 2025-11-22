@@ -4,6 +4,8 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, EndpointConnectionError
 import time
 import uuid
+import secrets
+import string
 from typing import Optional
 
 
@@ -226,8 +228,6 @@ def create_instance_aws(region_name, image_id='ami-03c1f788292172a4e', instance_
     params = {
         'ImageId': image_id,
         'InstanceType': instance_type,
-        'MinCount': min_count,
-        'MaxCount': max_count,
     }
     if key_name:
         params['KeyName'] = key_name
@@ -251,57 +251,70 @@ def create_instance_aws(region_name, image_id='ami-03c1f788292172a4e', instance_
             ]
         }
     ]
-    # If a password is provided, build a cloud-init / userdata script to set it
-        if password:
-                # Use cloud-init (YAML) user-data to set passwords and enable SSH password authentication.
-                # This is more portable across AMIs that support cloud-init.
-                # The chpasswd block sets passwords for common users; expire: False avoids forcing password change.
-                user_data = f"""#cloud-config
-chpasswd:
-    list: |
-        ec2-user:{password}
-        ubuntu:{password}
-        debian:{password}
-    expire: False
-ssh_pwauth: True
-"""
-                params['UserData'] = user_data
+    # We'll create instances one-by-one when we need per-instance unique passwords.
+    def _gen_password(length: int = 14) -> str:
+        alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
+        while True:
+            pw = ''.join(secrets.choice(alphabet) for _ in range(length))
+            if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                    and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
+                return pw
 
     try:
-        resp = client.run_instances(**params)
-        ids = [i.get('InstanceId') for i in resp.get('Instances', [])]
-
-        # Wait for instances to reach 'running' state and collect their public IPs
+        # Decide how many instances to create. Prefer max_count if >1, otherwise use min_count.
+        count = max_count if (max_count and max_count > 1) else (min_count or 1)
         created = []
-        if ids:
+
+        for i in range(count):
+            # generate a unique password per instance
+            instance_pw = _gen_password()
+            safe_pw = instance_pw.replace('"', '\\"')
+            user_data = f"""#cloud-config
+chpasswd:
+  list: |
+    ubuntu:{safe_pw}
+  expire: False
+ssh_pwauth: True
+runcmd:
+  - [ bash, -lc, "id -u ubuntu >/dev/null 2>&1 || useradd -m -s /bin/bash ubuntu" ]
+  - [ bash, -lc, "echo 'ubuntu:{safe_pw}' | chpasswd" ]
+"""
+
+            params_iter = params.copy()
+            params_iter['UserData'] = user_data
+            # Ensure TagSpecifications uses Name; if multiple instances are created with same Name,
+            # the tag will be the same for all (that's acceptable) — if you want unique names,
+            # the caller can pass different names.
+
+            resp = client.run_instances(**params_iter, MinCount=1, MaxCount=1)
+            ids = [i.get('InstanceId') for i in resp.get('Instances', [])]
+            if not ids:
+                continue
+
+            inst_id = ids[0]
+            # Wait for this instance to be running
             waiter = client.get_waiter('instance_running')
             try:
-                waiter.wait(InstanceIds=ids, WaiterConfig={'Delay': 3, 'MaxAttempts': 20})
+                waiter.wait(InstanceIds=[inst_id], WaiterConfig={'Delay': 3, 'MaxAttempts': 20})
             except Exception:
-                # If waiter fails or times out, proceed to describe instances anyway
                 pass
 
-            desc = client.describe_instances(InstanceIds=ids)
+            desc = client.describe_instances(InstanceIds=[inst_id])
             for reservation in desc.get('Reservations', []):
                 for inst in reservation.get('Instances', []):
                     inst_id = inst.get('InstanceId')
                     public_ip = inst.get('PublicIpAddress')
-                    # Name tag
                     name_tag = None
                     for t in inst.get('Tags', []) or []:
                         if t.get('Key') == 'Name':
                             name_tag = t.get('Value')
                             break
-                    # Determine recommended username based on common AMI types
-                    primary_username = 'ec2-user'
-                    alt_usernames = ['ubuntu', 'debian', 'admin']
                     created.append({
                         'InstanceId': inst_id,
                         'Name': name_tag,
                         'PublicIpAddress': public_ip,
-                        'Password': password,
-                        'username': primary_username,
-                        'alt_usernames': alt_usernames
+                        'Password': instance_pw,
+                        'username': 'ubuntu'
                     })
 
         return created
@@ -318,11 +331,14 @@ ssh_pwauth: True
 def delete_instance_aws(instance_id=None, name=None, region_name=None, aws_access_key=None, aws_secret_key=None, aws_session_token=None):
     """Termina una instancia EC2 por `instance_id` o por tag Name si se pasa `name`."""
     client = _get_ec2_client(region_name, aws_access_key, aws_secret_key, aws_session_token)
+    warning_msg = None
     try:
+        target_ids = None
+
         if not instance_id and name:
             # Ensure we only search for t3- prefixed names
             search_name = name if name.startswith('t3-') else f't3-{name}'
-            # Buscar por tag Name
+            # Buscar por tag Name (exact match)
             resp = client.describe_instances(Filters=[{'Name': 'tag:Name', 'Values': [search_name]}])
             instances = []
             for r in resp.get('Reservations', []):
@@ -330,13 +346,12 @@ def delete_instance_aws(instance_id=None, name=None, region_name=None, aws_acces
                     instances.append(inst.get('InstanceId'))
             if not instances:
                 return {'terminated': [], 'message': f'No instance with Name={search_name} found'}
-            instance_id = instances[0]
+            # Terminate all matching instances rather than only the first
+            target_ids = instances
 
-        if not instance_id:
-            raise ValueError('instance_id or name must be provided')
-
-        # If instance_id provided directly, ensure it has Name tag starting with t3-
-        if instance_id and not name:
+        elif instance_id:
+            target_ids = [instance_id]
+            # If instance_id provided directly, check Name tag for a warning (do not refuse)
             try:
                 check = client.describe_instances(InstanceIds=[instance_id])
                 found_name = None
@@ -346,15 +361,21 @@ def delete_instance_aws(instance_id=None, name=None, region_name=None, aws_acces
                             if t.get('Key') == 'Name':
                                 found_name = t.get('Value')
                                 break
-                if not found_name or not found_name.startswith('t3-'):
-                    return {'terminated': [], 'message': 'Refusing to delete instance without t3- prefix in Name tag'}
+                if found_name and not found_name.startswith('t3-'):
+                    warning_msg = f"Warning: instance {instance_id} has Name='{found_name}' which does not start with 't3-'. Proceeding with termination as requested."
             except ClientError:
                 # proceed to attempt termination (error will be handled below)
                 pass
 
-        resp = client.terminate_instances(InstanceIds=[instance_id])
+        if not target_ids:
+            raise ValueError('instance_id or name must be provided')
+
+        resp = client.terminate_instances(InstanceIds=target_ids)
         terminated = [t.get('InstanceId') for t in resp.get('TerminatingInstances', [])]
-        return {'terminated': terminated}
+        result = {'terminated': terminated}
+        if warning_msg:
+            result['warning'] = warning_msg
+        return result
     except NoCredentialsError:
         raise RuntimeError("No AWS credentials found. Cannot delete instance.")
     except EndpointConnectionError as e:

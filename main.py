@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+import secrets
+import string
 
 app = FastAPI()
 
@@ -67,6 +69,17 @@ def _load_aws_credentials_file(path: Optional[str] = None):
             return data or {}
     except Exception:
         return {}
+
+
+def _generate_password(length: int = 14) -> str:
+    """Generate a reasonably strong random password containing upper, lower, digits and punctuation."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
+    # ensure at least one lowercase, one uppercase, one digit, one punctuation
+    while True:
+        pw = ''.join(secrets.choice(alphabet) for _ in range(length))
+        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
+            return pw
 
 # Note: `aws_session_token` is optional. For permanent IAM user keys you only need
 # `aws_access_key_id` and `aws_secret_access_key`. `aws_session_token` is required
@@ -147,13 +160,14 @@ def api_find(req: FindRequest):
 def api_create(req: CreateRequest):
     creds = _set_credentials_and_load(req.credentials)
     try:
+        # Let the create_instance helper generate a random password per-instance
         result = create_instance(
             project_id=creds['project_id'],
             zone=req.zone,
             instance_name=req.name,
             machine_type=req.machine_type,
             ssh_key=req.ssh_key,
-            password=req.password
+            password=getattr(req, 'password', None)
         )
         # result is a dict with keys: success, name, public_ip, password or error
         return result
@@ -377,11 +391,12 @@ def api_aws_create(req: AwsCreateRequest):
         else:
             aws_creds = _load_aws_credentials_file()
 
+        # Let create_instance_aws generate unique random passwords per instance
         created = create_instance_aws(
             region_name=req.region or aws_creds.get('region') or 'us-west-2',
             image_id=req.image_id,
             instance_type=req.instance_type,
-            password=req.password,
+            password=getattr(req, 'password', None),
             name=req.name,
             key_name=req.key_name,
             security_group_ids=req.security_group_ids,
