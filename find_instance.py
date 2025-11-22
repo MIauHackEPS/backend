@@ -1,193 +1,64 @@
 #!/usr/bin/env python3
 """
-Script para borrar una instancia de GCP por su nombre
+Script simple para buscar instancias de GCP según criterios
 """
 import argparse
 import json
 from google.cloud import compute_v1
 
 
-def delete_instance(project_id, zone, instance_name):
+def find_instances(project_id, zone, region, num_cpus, num_ram_gb):
     """
-    Borra una instancia de GCP
+    Busca tipos de instancias que cumplan con los requisitos
     
     Args:
         project_id: ID del proyecto de GCP
-        zone: Zona de GCP donde está la instancia
-        instance_name: Nombre de la instancia a borrar
-    
-    Returns:
-        bool: True si se borró exitosamente, False en caso contrario
+        zone: Zona de GCP (ej: us-central1-a)
+        region: Región de GCP (ej: us-central1)
+        num_cpus: Número mínimo de CPUs
+        num_ram_gb: Cantidad mínima de RAM en GB
     """
-    instance_client = compute_v1.InstancesClient()
+    print(f"Buscando instancias en zona: {zone}")
+    print(f"Requisitos: {num_cpus} CPUs, {num_ram_gb} GB RAM")
+    
+    # Cliente de compute
+    client = compute_v1.MachineTypesClient()
+    
+    # Lista de tipos de máquina disponibles
+    machine_types = []
     
     try:
-        # Primero verificar si la instancia existe
-        print(f"Verificando si la instancia '{instance_name}' existe en la zona {zone}...")
-        
-        try:
-            instance = instance_client.get(
-                project=project_id,
-                zone=zone,
-                instance=instance_name
-            )
-            print(f"✓ Instancia encontrada: {instance.name}")
-            print(f"  Estado: {instance.status}")
-            print(f"  Tipo: {instance.machine_type.split('/')[-1]}")
-            print()
-        except Exception as e:
-            print(f"❌ Error: La instancia '{instance_name}' no existe en la zona {zone}")
-            return False
-        
-        # Confirmar borrado
-        print(f"⚠️  ADVERTENCIA: Estás a punto de borrar la instancia '{instance_name}'")
-        print(f"   Esta acción NO se puede deshacer.")
-        print()
-        
-        # Proceder con el borrado
-        print(f"Enviando solicitud de borrado...")
-        
-        request = compute_v1.DeleteInstanceRequest(
+        # Obtener tipos de máquina en la zona especificada
+        request = compute_v1.ListMachineTypesRequest(
             project=project_id,
-            zone=zone,
-            instance=instance_name
+            zone=zone
         )
         
-        operation = instance_client.delete(request=request)
-        
-        print(f"Operación iniciada: {operation.name}")
-        print("Esperando a que se complete la operación...")
-        
-        # Esperar a que se complete la operación
-        operation_client = compute_v1.ZoneOperationsClient()
-        while operation.status != compute_v1.Operation.Status.DONE:
-            operation = operation_client.get(
-                project=project_id,
-                zone=zone,
-                operation=operation.name
-            )
-        
-        if operation.error:
-            print(f"\n❌ Error al borrar la instancia:")
-            for error in operation.error.errors:
-                print(f"  - {error.code}: {error.message}")
-            return False
-        else:
-            print(f"\n✅ Instancia '{instance_name}' borrada exitosamente!")
-            print(f"   Zona: {zone}")
-            return True
+        for machine_type in client.list(request=request):
+            # Convertir MB a GB para la RAM
+            ram_gb = machine_type.memory_mb / 1024
             
-    except Exception as e:
-        print(f"\n❌ Error al borrar la instancia: {e}")
-        return False
-
-
-def find_and_delete_instance(project_id, instance_name):
-    """
-    Busca una instancia en todas las zonas y la borra
-    
-    Args:
-        project_id: ID del proyecto de GCP
-        instance_name: Nombre de la instancia a borrar
-    
-    Returns:
-        bool: True si se borró exitosamente, False en caso contrario
-    """
-    print(f"Buscando instancia '{instance_name}' en todas las zonas...\n")
-    
-    instance_client = compute_v1.InstancesClient()
-    zones_client = compute_v1.ZonesClient()
-    
-    try:
-        # Listar todas las zonas
-        request = compute_v1.ListZonesRequest(project=project_id)
-        zones = list(zones_client.list(request=request))
+            # Filtrar por requisitos
+            if machine_type.guest_cpus == num_cpus and ram_gb == num_ram_gb :
+                machine_types.append({
+                    'name': machine_type.name,
+                    'cpus': machine_type.guest_cpus,
+                    'ram_gb': round(ram_gb, 2),
+                    'description': machine_type.description
+                })
         
-        # Buscar la instancia en cada zona
-        for zone_info in zones:
-            zone_name = zone_info.name
-            try:
-                instance = instance_client.get(
-                    project=project_id,
-                    zone=zone_name,
-                    instance=instance_name
-                )
-                
-                # Si llegamos aquí, la instancia existe en esta zona
-                print(f"✓ Instancia encontrada en la zona: {zone_name}")
-                print(f"  Estado: {instance.status}")
-                print(f"  Tipo: {instance.machine_type.split('/')[-1]}")
-                print()
-                
-                # Borrar la instancia
-                return delete_instance(project_id, zone_name, instance_name)
-                
-            except Exception:
-                # La instancia no está en esta zona, continuar buscando
-                pass
+        # Mostrar resultados
+        print(f"\nEncontradas {len(machine_types)} instancias compatibles:\n")
+        for mt in machine_types[:10]:  # Mostrar solo las primeras 10
+            print(f"  - {mt['name']}: {mt['cpus']} CPUs, {mt['ram_gb']} GB RAM")
+            print(f"    {mt['description']}")
+            print()
         
-        # Si llegamos aquí, no se encontró la instancia en ninguna zona
-        print(f"❌ Error: La instancia '{instance_name}' no se encontró en ninguna zona del proyecto")
-        return False
+        if len(machine_types) > 10:
+            print(f"... y {len(machine_types) - 10} más")
+        
+        return machine_types
         
     except Exception as e:
-        print(f"❌ Error al buscar la instancia: {e}")
-        return False
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Borrar una instancia de GCP'
-    )
-    
-    parser.add_argument(
-        '--credentials',
-        required=True,
-        help='Ruta al archivo de credenciales de GCP (JSON)'
-    )
-    
-    parser.add_argument(
-        '--name',
-        required=True,
-        help='Nombre de la instancia a borrar'
-    )
-    
-    parser.add_argument(
-        '--zone',
-        help='Zona de GCP donde está la instancia (ej: us-central1-a). Si no se especifica, busca en todas las zonas'
-    )
-    
-    args = parser.parse_args()
-    
-    # Cargar credenciales
-    print(f"Cargando credenciales desde: {args.credentials}\n")
-    
-    import os
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = args.credentials
-    
-    with open(args.credentials, 'r') as f:
-        credentials = json.load(f)
-    
-    # Borrar instancia
-    if args.zone:
-        # Borrar en una zona específica
-        success = delete_instance(
-            project_id=credentials['project_id'],
-            zone=args.zone,
-            instance_name=args.name
-        )
-    else:
-        # Buscar en todas las zonas y borrar
-        success = find_and_delete_instance(
-            project_id=credentials['project_id'],
-            instance_name=args.name
-        )
-    
-    if success:
-        print("\n🎉 Operación completada exitosamente")
-    else:
-        print("\n⚠️  La operación no se pudo completar")
-
-
-if __name__ == '__main__':
-    main()
+        print(f"Error al buscar instancias: {e}")
+        return []

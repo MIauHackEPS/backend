@@ -5,6 +5,7 @@ Script para borrar una instancia de GCP por su nombre
 import argparse
 import json
 from google.cloud import compute_v1
+from create_instance import sanitize_gcp_name
 
 
 def delete_instance(project_id, zone, instance_name):
@@ -22,14 +23,18 @@ def delete_instance(project_id, zone, instance_name):
     instance_client = compute_v1.InstancesClient()
     
     try:
+        # Sanitize name for GCP
+        safe_name = sanitize_gcp_name(instance_name)
+        if safe_name != instance_name:
+            print(f"Nota: nombre solicitado '{instance_name}' sanitizado a '{safe_name}' para GCP (nombres GCP no permiten '_').")
         # Primero verificar si la instancia existe
-        print(f"Verificando si la instancia '{instance_name}' existe en la zona {zone}...")
+        print(f"Verificando si la instancia '{safe_name}' existe en la zona {zone}...")
         
         try:
             instance = instance_client.get(
                 project=project_id,
                 zone=zone,
-                instance=instance_name
+                instance=safe_name
             )
             print(f"✓ Instancia encontrada: {instance.name}")
             print(f"  Estado: {instance.status}")
@@ -40,7 +45,7 @@ def delete_instance(project_id, zone, instance_name):
             return False
         
         # Confirmar borrado
-        print(f"⚠️  ADVERTENCIA: Estás a punto de borrar la instancia '{instance_name}'")
+        print(f"⚠️  ADVERTENCIA: Estás a punto de borrar la instancia '{safe_name}'")
         print(f"   Esta acción NO se puede deshacer.")
         print()
         
@@ -50,7 +55,7 @@ def delete_instance(project_id, zone, instance_name):
         request = compute_v1.DeleteInstanceRequest(
             project=project_id,
             zone=zone,
-            instance=instance_name
+            instance=safe_name
         )
         
         operation = instance_client.delete(request=request)
@@ -107,10 +112,11 @@ def find_and_delete_instance(project_id, instance_name):
         for zone_info in zones:
             zone_name = zone_info.name
             try:
+                safe_name = sanitize_gcp_name(instance_name)
                 instance = instance_client.get(
                     project=project_id,
                     zone=zone_name,
-                    instance=instance_name
+                    instance=safe_name
                 )
                 
                 # Si llegamos aquí, la instancia existe en esta zona
@@ -119,8 +125,8 @@ def find_and_delete_instance(project_id, instance_name):
                 print(f"  Tipo: {instance.machine_type.split('/')[-1]}")
                 print()
                 
-                # Borrar la instancia
-                return delete_instance(project_id, zone_name, instance_name)
+                # Borrar la instancia (usar nombre sanitizado)
+                return delete_instance(project_id, zone_name, safe_name)
                 
             except Exception:
                 # La instancia no está en esta zona, continuar buscando

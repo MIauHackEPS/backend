@@ -1,0 +1,5 @@
+{
+  "credentials": "./credentials.json",
+  "name": "mi-instancia-gcp-1",
+  "zone": "europe-west1-b"
+}

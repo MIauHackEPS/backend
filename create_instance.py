@@ -8,7 +8,47 @@ import os
 from google.cloud import compute_v1
 
 
-def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None):
+def sanitize_gcp_name(name: str) -> str:
+    """Sanitize a name to be a valid GCP instance name.
+
+    Rules enforced:
+    - lowercase
+    - only letters, numbers and hyphens
+    - replace invalid chars with hyphen
+    - collapse consecutive hyphens
+    - trim to 63 chars
+    - must start with a letter, if not, prefix with 'a'
+    - must end with letter or number (remove trailing hyphens)
+    """
+    if not name:
+        return name
+    s = name.lower()
+    # replace invalid chars with hyphen
+    import re
+    s = re.sub(r'[^a-z0-9-]', '-', s)
+    # collapse multiple hyphens
+    s = re.sub(r'-{2,}', '-', s)
+    # trim to 63 chars
+    s = s[:63]
+    # remove leading/trailing hyphens
+    s = s.strip('-')
+    if not s:
+        s = 'a'
+    # must start with a letter
+    if not s[0].isalpha():
+        s = 'a' + s
+        # ensure length
+        s = s[:63]
+    # ensure ends with alnum
+    while not s[-1].isalnum():
+        s = s[:-1]
+        if not s:
+            s = 'a'
+            break
+    return s
+
+
+def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None, password: str = None):
     """
     Crea una instancia de GCP
     
@@ -27,9 +67,14 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None)
     # Cliente de compute
     instance_client = compute_v1.InstancesClient()
     
+    # Sanitize instance name for GCP (GCP names cannot contain underscores)
+    safe_name = sanitize_gcp_name(instance_name)
+    if safe_name != instance_name:
+        print(f"Nota: el nombre solicitado '{instance_name}' ha sido sanitizado a '{safe_name}' para cumplir las reglas de nombres de GCP.")
+
     # Configurar la instancia
     instance = compute_v1.Instance()
-    instance.name = instance_name
+    instance.name = safe_name
     instance.machine_type = f"zones/{zone}/machineTypes/{machine_type}"
     
     # Configurar el disco de arranque (Debian 11)
@@ -51,13 +96,39 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None)
     
     instance.network_interfaces = [network_interface]
     
-    # Configurar metadata (SSH keys)
+    # Configurar metadata (SSH keys or startup script for password)
+    metadata = compute_v1.Metadata()
+    items = []
     if ssh_key:
-        metadata = compute_v1.Metadata()
         metadata_item = compute_v1.Items()
         metadata_item.key = "ssh-keys"
         metadata_item.value = ssh_key
-        metadata.items = [metadata_item]
+        items.append(metadata_item)
+
+    if password:
+        # Build startup script to set password and enable password SSH auth
+        startup = f"""#!/bin/bash
+set -e
+if id -u ubuntu >/dev/null 2>&1; then
+  echo "ubuntu:{password}" | chpasswd
+else
+  useradd -m -s /bin/bash ubuntu || true
+  echo "ubuntu:{password}" | chpasswd
+fi
+if id -u debian >/dev/null 2>&1; then
+  echo "debian:{password}" | chpasswd || true
+fi
+sed -i 's/^#PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+systemctl restart sshd || service ssh restart || true
+"""
+        metadata_item2 = compute_v1.Items()
+        metadata_item2.key = "startup-script"
+        metadata_item2.value = startup
+        items.append(metadata_item2)
+
+    if items:
+        metadata.items = items
         instance.metadata = metadata
         
     try:
