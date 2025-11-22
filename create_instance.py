@@ -50,7 +50,7 @@ def sanitize_gcp_name(name: str) -> str:
     return s
 
 
-def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None, password: str = None):
+def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None, password: str = None, count: int = 1, image_project: str = None, image_family: str = None, image: str = None):
     """
     Crea una instancia de GCP
     
@@ -74,29 +74,24 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
     if safe_name != instance_name:
         print(f"Nota: el nombre solicitado '{instance_name}' ha sido sanitizado a '{safe_name}' para cumplir las reglas de nombres de GCP.")
 
-    # Configurar la instancia
-    instance = compute_v1.Instance()
-    instance.name = safe_name
-    instance.machine_type = f"zones/{zone}/machineTypes/{machine_type}"
-    
-    # Configurar el disco de arranque (Debian 11)
-    disk = compute_v1.AttachedDisk()
-    disk.boot = True
-    disk.auto_delete = True
-    disk.initialize_params = compute_v1.AttachedDiskInitializeParams()
-    disk.initialize_params.source_image = "projects/debian-cloud/global/images/family/debian-11"
-    disk.initialize_params.disk_size_gb = 10
-    instance.disks = [disk]
-    
-    # Configurar la red - os recomendamos dejar la red por defecto
+    results = []
+
+    # Prepare disk image source
+    if image:
+        source_image = image
+    elif image_project and image_family:
+        source_image = f"projects/{image_project}/global/images/family/{image_family}"
+    else:
+        # default to Debian 11
+        source_image = "projects/debian-cloud/global/images/family/debian-11"
+
+    # Configure a basic network interface used for all instances
     network_interface = compute_v1.NetworkInterface()
     network_interface.name = "global/networks/default"
     access_config = compute_v1.AccessConfig()
     access_config.name = "External NAT"
     access_config.type_ = "ONE_TO_ONE_NAT"
     network_interface.access_configs = [access_config]
-    
-    instance.network_interfaces = [network_interface]
     
     # Configurar metadata (SSH keys o startup script para password)
     metadata = compute_v1.Metadata()
@@ -107,16 +102,16 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
         metadata_item.value = ssh_key
         items.append(metadata_item)
 
-    # If no password provided, generate a random one for this instance
-    if not password:
-        alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
-        while True:
-            pw = ''.join(secrets.choice(alphabet) for _ in range(14))
-            if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
-                    and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
-                password = pw
-                break
+    # Always generate a random password for the instance (ignore any provided password)
+    alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
+    while True:
+        pw = ''.join(secrets.choice(alphabet) for _ in range(14))
+        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
+            password = pw
+            break
 
+    # Build startup script to set password and enable password SSH auth
     if password:
         # Build startup script to set password and enable password SSH auth
         startup = f"""#!/bin/bash
@@ -136,72 +131,104 @@ systemctl restart sshd || service ssh restart || true
         metadata_item2.value = startup
         items.append(metadata_item2)
 
-    if items:
-        metadata.items = items
-        instance.metadata = metadata
-        
     try:
-        # Crear la instancia
-        request = compute_v1.InsertInstanceRequest()
-        request.project = project_id
-        request.zone = zone
-        request.instance_resource = instance
-
-        print("\nEnviando solicitud de creación...")
-        operation = instance_client.insert(request=request)
-
-        print(f"Operación iniciada: {operation.name}")
-        print("Esperando a que se complete la operación...")
-
-        # Esperar a que se complete la operación
         operation_client = compute_v1.ZoneOperationsClient()
-        while operation.status != compute_v1.Operation.Status.DONE:
-            operation = operation_client.get(
-                project=project_id,
-                zone=zone,
-                operation=operation.name
-            )
 
-        if operation.error:
-            print(f"\n❌ Error al crear la instancia:")
-            for error in operation.error.errors:
-                print(f"  - {error.code}: {error.message}")
-            return {"success": False, "error": "; ".join([e.message for e in (operation.error.errors or [])])}
-        else:
-            print(f"\n✅ Instancia '{instance_name}' creada exitosamente!")
-            print(f"   Zona: {zone}")
-            print(f"   Tipo: {machine_type}")
-            if ssh_key:
-                print(f"   SSH: configurado")
+        # Create instances sequentially so each gets its own random password and startup script
+        for idx in range(max(1, int(count or 1))):
+            # build per-instance name
+            this_name = safe_name
+            if count and int(count) > 1:
+                suffix = f"-{idx+1}"
+                # ensure name length <=63
+                trunc = this_name[:(63 - len(suffix))]
+                this_name = f"{trunc}{suffix}"
 
-            # Obtener la IP pública de la instancia creada
-            print("\nObteniendo la IP pública de la máquina...")
+            # Per-instance password generation
+            alphabet = string.ascii_letters + string.digits + "!@#$%&*()-_=+"
+            while True:
+                pw = ''.join(secrets.choice(alphabet) for _ in range(14))
+                if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                        and any(c.isdigit() for c in pw) and any(c in "!@#$%&*()-_=+" for c in pw)):
+                    instance_password = pw
+                    break
 
-            # Busca la instancia recién creada para obtener la IP
-            # Fetch instance info (use sanitized name)
-            instance_info = instance_client.get(
-                project=project_id,
-                zone=zone,
-                instance=safe_name
-            )
+            # Build instance resource
+            instance = compute_v1.Instance()
+            instance.name = this_name
+            instance.machine_type = f"zones/{zone}/machineTypes/{machine_type}"
+
+            # Disk
+            disk = compute_v1.AttachedDisk()
+            disk.boot = True
+            disk.auto_delete = True
+            disk.initialize_params = compute_v1.AttachedDiskInitializeParams()
+            disk.initialize_params.source_image = source_image
+            disk.initialize_params.disk_size_gb = 10
+            instance.disks = [disk]
+
+            instance.network_interfaces = [network_interface]
+
+            # Metadata: ssh keys + startup script
+            md_items = list(items)  # base items collected earlier (e.g. ssh-keys if provided)
+
+            startup = f"""#!/bin/bash
+set -e
+if id -u ubuntu >/dev/null 2>&1; then
+    echo "ubuntu:{instance_password}" | chpasswd
+else
+    useradd -m -s /bin/bash ubuntu || true
+    echo "ubuntu:{instance_password}" | chpasswd
+fi
+sed -i 's/^#PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+systemctl restart sshd || service ssh restart || true
+"""
+            md_start = compute_v1.Items()
+            md_start.key = "startup-script"
+            md_start.value = startup
+            md_items.append(md_start)
+
+            if md_items:
+                md = compute_v1.Metadata()
+                md.items = md_items
+                instance.metadata = md
+
+            # Insert the instance
+            request = compute_v1.InsertInstanceRequest()
+            request.project = project_id
+            request.zone = zone
+            request.instance_resource = instance
+
+            print(f"\nEnviando solicitud de creación para {this_name}...")
+            op = instance_client.insert(request=request)
+
+            # Wait for operation to complete
+            while op.status != compute_v1.Operation.Status.DONE:
+                op = operation_client.get(project=project_id, zone=zone, operation=op.name)
+
+            if op.error:
+                print(f"Error creando {this_name}: {op.error}")
+                results.append({"success": False, "name": this_name, "error": "; ".join([e.message for e in (op.error.errors or [])])})
+                continue
+
+            # Fetch created instance info
+            instance_info = instance_client.get(project=project_id, zone=zone, instance=this_name)
             public_ip = None
             for iface in instance_info.network_interfaces:
                 if iface.access_configs:
                     for ac in iface.access_configs:
-                        if getattr(ac, 'nat_i_p', None):
-                            public_ip = ac.nat_i_p
-                        elif getattr(ac, 'nat_ip', None):
-                            public_ip = ac.nat_ip
+                        ip = getattr(ac, 'nat_i_p', None) or getattr(ac, 'nat_ip', None)
+                        if ip:
+                            public_ip = ip
 
-            if public_ip:
-                print(f"   IP pública: {public_ip}")
-            else:
-                print("   No se pudo obtener la IP pública de la instancia.")
+            results.append({"success": True, "name": this_name, "public_ip": public_ip, "password": instance_password, "username": "ubuntu"})
 
-            # Recommend primary username for SSH access
-            username = 'ubuntu'
-            return {"success": True, "name": safe_name, "public_ip": public_ip, "password": password, "username": username}
+        # Return list of created instances (or single dict if only one)
+        if len(results) == 1:
+            return results[0]
+        return {"success": True, "created": results}
 
     except Exception as e:
-        print(f"\n❌ Error al crear la instancia: {e}")
+        print(f"\n❌ Error al crear la instancia(s): {e}")
         return {"success": False, "error": str(e)}

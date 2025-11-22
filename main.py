@@ -101,6 +101,10 @@ class CreateRequest(BaseModel):
     machine_type: str
     ssh_key: Optional[str] = None
     password: Optional[str] = None
+    count: Optional[int] = 1
+    image_project: Optional[str] = None
+    image_family: Optional[str] = None
+    image: Optional[str] = None
 
 
 class ListRequest(BaseModel):
@@ -167,7 +171,11 @@ def api_create(req: CreateRequest):
             instance_name=req.name,
             machine_type=req.machine_type,
             ssh_key=req.ssh_key,
-            password=getattr(req, 'password', None)
+            password=getattr(req, 'password', None),
+            count=getattr(req, 'count', 1),
+            image_project=getattr(req, 'image_project', None),
+            image_family=getattr(req, 'image_family', None),
+            image=getattr(req, 'image', None)
         )
         # result is a dict with keys: success, name, public_ip, password or error
         return result
@@ -372,6 +380,44 @@ def api_aws_find(req: AwsFindRequest):
         if not instances:
             return {"success": True, "count": 0, "instances": [], "message": "No se encontraron instancias t3- para esa búsqueda"}
         return {"success": True, "count": len(instances), "instances": instances}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/instance-types/gcp')
+def api_gcp_instance_types(zone: Optional[str] = None, credentials: Optional[str] = None, cpus: Optional[int] = None, ram_gb: Optional[int] = None, region: Optional[str] = None):
+    """GET endpoint para que Astro pregunte por tipos de instancia GCP según cpus/ram.
+
+    Query params:
+      - zone: zona (requerido)
+      - credentials: ruta al JSON de credenciales (opcional)
+      - cpus: número mínimo de CPUs
+      - ram_gb: número mínimo de RAM (GB)
+      - region: región (opcional, usada por find_instances)
+    """
+    if not zone:
+        raise HTTPException(status_code=400, detail="zone is required")
+    credentials_path = credentials or os.path.join(os.path.dirname(__file__), 'credentials.json')
+    creds = _set_credentials_and_load(credentials_path)
+    try:
+        results = find_instances(project_id=creds['project_id'], zone=zone, region=region or '', num_cpus=int(cpus or 1), num_ram_gb=int(ram_gb or 1))
+        return {"success": True, "count": len(results), "instance_types": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/instance-types/aws')
+def api_aws_instance_types(region: Optional[str] = None, min_vcpus: Optional[int] = None, min_memory_gb: Optional[float] = None, aws_access_key: Optional[str] = None, aws_secret_key: Optional[str] = None, aws_session_token: Optional[str] = None):
+    """GET endpoint para que Astro pregunte por tipos de instancia AWS según vCPU/memoria."""
+    try:
+        aws_creds = _load_aws_credentials_file()
+        aws_access = aws_access_key or aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key')
+        aws_secret = aws_secret_key or aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key')
+        aws_token = aws_session_token or aws_creds.get('aws_session_token')
+        region_name = region or aws_creds.get('region') or 'us-west-2'
+
+        results = find_instance_types_aws(region_name=region_name, min_vcpus=int(min_vcpus or 1), min_memory_gb=float(min_memory_gb or 1.0), aws_access_key=aws_access, aws_secret_key=aws_secret, aws_session_token=aws_token)
+        return {"success": True, "count": len(results), "instance_types": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
