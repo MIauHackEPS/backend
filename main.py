@@ -20,7 +20,10 @@ from google.cloud import compute_v1
 from dotenv import load_dotenv
 import time
 from datetime import datetime, timedelta
+import paramiko
+import openai
 from swarm_coordinator import get_swarm_info_via_ssh, prepare_worker_script, prepare_manager_script
+from ai_executor import execute_ai_command
 
 load_dotenv()
 
@@ -30,10 +33,23 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # Tailscale Configuration
 TAILSCALE_AUTH_KEY = os.environ.get('TAILSCALE_AUTH_KEY')
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://innwater.eurecatprojects.com/lite-llm/")
+
+# Initialize OpenAI Client
+ai_client = None
+if OPENAI_API_KEY:
+    try:
+        ai_client = openai.Client(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+    except Exception as e:
+        print(f"Failed to initialize OpenAI client: {e}")
 
 # Cache for instance types (TTL: 5 minutes)
 _instance_types_cache = {}
-CACHE_TTL_SECONDS = 300  # 5 minutes
+_cache_ttl = timedelta(minutes=5)
+
+# In-memory storage for instance credentials (instance_name -> {username, password, ip, provider})
+_instance_credentials = {}
 
 def _get_cache_key(provider: str, zone_or_region: str, cpus: int, ram: int) -> str:
     """Generate cache key for instance types"""
@@ -43,7 +59,7 @@ def _get_from_cache(cache_key: str):
     """Get cached result if not expired"""
     if cache_key in _instance_types_cache:
         cached_data, timestamp = _instance_types_cache[cache_key]
-        if datetime.now() - timestamp < timedelta(seconds=CACHE_TTL_SECONDS):
+        if datetime.now() - timestamp < _cache_ttl:
             return cached_data
         else:
             # Expired, remove from cache
@@ -113,7 +129,9 @@ log_telegram() {
         -d text="🔹 [GCP-Manager] $MSG" >/dev/null || true
 }
 
-log_telegram "Starting initialization..."
+HOSTNAME=$(hostname)
+log_telegram "🚀 [Manager] Iniciando configuración en $HOSTNAME
+⏱️ Tiempo estimado: 3-5 minutos"
 
 # Flush firewall and allow all
 iptables -F
@@ -134,7 +152,8 @@ iptables -A INPUT -p tcp --dport 8000 -j ACCEPT
 while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do sleep 1 ; done
 while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ; do sleep 1 ; done
 
-log_telegram "Installing Docker and dependencies..."
+log_telegram "📦 [Manager] Instalando Docker, Docker Compose, curl y jq...
+⏳ Esto puede tardar 1-2 minutos"
 apt-get update
 apt-get install -y docker.io docker-compose curl jq
 
@@ -144,10 +163,13 @@ usermod -aG docker ubuntu
 
 # Get Public IP from metadata
 PUBLIC_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
-log_telegram "Public IP detected: ${PUBLIC_IP}"
+log_telegram "🌐 [Manager] IP Pública detectada: ${PUBLIC_IP}
+✅ Firewall configurado (puertos 2377, 7946, 4789, 9443, 8000)"
 
 # Initialize Swarm with Public IP
-log_telegram "Initializing Swarm on ${PUBLIC_IP}..."
+log_telegram "🐝 [Manager] Inicializando Docker Swarm...
+📍 Advertise Address: ${PUBLIC_IP}:2377
+🔧 Generando tokens de Manager y Worker..."
 docker swarm init --advertise-addr ${PUBLIC_IP} || true
 
 # Wait for docker to be ready
@@ -174,10 +196,21 @@ docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always \
   portainer/portainer-ce:latest
 
 # Wait for Portainer to be ready
-log_telegram "Waiting for Portainer to start..."
+log_telegram "🎨 [Manager] Desplegando Portainer...
+⏳ Esperando que el contenedor esté listo (max 60s)"
 timeout 60s bash -c 'until curl -k -s https://localhost:9443 >/dev/null; do sleep 2; done'
 
-log_telegram "✅ EVERYTHING READY! Access Portainer at: https://${PUBLIC_IP}:9443"
+log_telegram "✅ [Manager] ¡SWARM MANAGER LISTO!
+
+🎯 Acceso a Portainer:
+   https://${PUBLIC_IP}:9443
+
+📊 Estado del Cluster:
+   • Manager: $HOSTNAME (${PUBLIC_IP})
+   • Puertos abiertos: 2377, 7946, 4789, 9443, 8000
+   • Workers: Esperando conexión...
+
+💡 Los workers se conectarán automáticamente"
 echo "Swarm manager initialized. Public IP: ${PUBLIC_IP}"
 """,
     "docker-swarm-worker": """
@@ -192,7 +225,11 @@ log_telegram() {
         -d text="🔸 [AWS-Worker] $MSG" >/dev/null || true
 }
 
-log_telegram "Starting initialization..."
+HOSTNAME=$(hostname)
+WORKER_IP=$(hostname -I | awk '{print $1}')
+log_telegram "🔧 [Worker] Iniciando configuración en $HOSTNAME
+📍 IP Local: $WORKER_IP
+⏱️ Tiempo estimado: 2-3 minutos"
 
 # Flush firewall
 iptables -F
@@ -202,7 +239,8 @@ ufw disable || true
 while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do sleep 1 ; done
 while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ; do sleep 1 ; done
 
-log_telegram "Installing Docker and dependencies..."
+log_telegram "📦 [Worker] Instalando Docker y dependencias...
+⏳ Configurando entorno de contenedores"
 apt-get update
 apt-get install -y docker.io docker-compose curl
 
@@ -215,11 +253,22 @@ usermod -aG docker ubuntu
 # Wait for docker to be ready
 timeout 60s bash -c 'until docker info; do sleep 2; done'
 
-log_telegram "Joining Swarm..."
+MANAGER_IP_CLEAN=$(echo MANAGER_IP_PLACEHOLDER | cut -d':' -f1)
+log_telegram "🔗 [Worker] Conectando al Swarm Manager...
+📡 Manager IP: $MANAGER_IP_CLEAN
+🔑 Usando token de autenticación"
 # Join swarm (manager IP and token will be replaced)
 docker swarm join --token WORKER_TOKEN_PLACEHOLDER MANAGER_IP_PLACEHOLDER:2377
 
-log_telegram "Joined swarm successfully!"
+log_telegram "✅ [Worker] ¡Worker conectado exitosamente!
+
+📊 Información del nodo:
+   • Hostname: $HOSTNAME
+   • IP Local: $WORKER_IP
+   • Manager: $MANAGER_IP_CLEAN
+   • Estado: Activo y listo para recibir tareas
+
+💡 Este nodo ya está disponible en el cluster"
 
 echo "Joined swarm as worker"
 """,
@@ -310,13 +359,49 @@ def stop_instance_gcp(project_id, zone, instance_name):
     op = client.stop(project=project_id, zone=zone, instance=instance_name)
     return op
 
+# --- Instance Specs Mapping ---
+INSTANCE_SPECS = {
+    # GCP
+    'e2-micro': {'cpu': 2, 'ram': 1},
+    'e2-small': {'cpu': 2, 'ram': 2},
+    'e2-medium': {'cpu': 2, 'ram': 4},
+    'e2-standard-2': {'cpu': 2, 'ram': 8},
+    'e2-standard-4': {'cpu': 4, 'ram': 16},
+    'n1-standard-1': {'cpu': 1, 'ram': 3.75},
+    'n1-standard-2': {'cpu': 2, 'ram': 7.5},
+    'c2d-highcpu-2': {'cpu': 2, 'ram': 4},
+    
+    # AWS
+    't2.micro': {'cpu': 1, 'ram': 1},
+    't2.small': {'cpu': 1, 'ram': 2},
+    't2.medium': {'cpu': 2, 'ram': 4},
+    't3.micro': {'cpu': 2, 'ram': 1},
+    't3.small': {'cpu': 2, 'ram': 2},
+    't3.medium': {'cpu': 2, 'ram': 4},
+    't3.large': {'cpu': 2, 'ram': 8},
+}
+
+def get_instance_specs(machine_type):
+    if not machine_type:
+        return {'cpu': '?', 'ram': '?'}
+    # Handle GCP full URL (zones/us-central1-a/machineTypes/e2-medium)
+    if '/' in machine_type:
+        machine_type = machine_type.split('/')[-1]
+    
+    return INSTANCE_SPECS.get(machine_type, {'cpu': '?', 'ram': '?'})
+
 def _serialize_instances(instances, zone=None):
     out = []
     for inst in instances:
+        m_type = getattr(inst, 'machine_type', None).split('/')[-1] if getattr(inst, 'machine_type', None) else None
+        specs = get_instance_specs(m_type)
+        
         item = {
             'name': getattr(inst, 'name', None),
             'status': getattr(inst, 'status', None),
-            'machine_type': getattr(inst, 'machine_type', None).split('/')[-1] if getattr(inst, 'machine_type', None) else None,
+            'machine_type': m_type,
+            'cpu': specs['cpu'],
+            'ram': specs['ram'],
             'creation_timestamp': getattr(inst, 'creation_timestamp', None),
             'zone': zone,
             'internal_ips': [],
@@ -381,6 +466,16 @@ class AwsCreateRequest(BaseModel):
     aws_session_token: Optional[str] = None
     cluster_type: Optional[str] = None
 
+class CredentialsRequest(BaseModel):
+    instance_name: str
+    provider: str  # "gcp" or "aws"
+    credentials: Optional[str] = None  # For GCP
+    zone: Optional[str] = None  # For GCP
+    region: Optional[str] = None  # For AWS
+    aws_access_key: Optional[str] = None
+    aws_secret_key: Optional[str] = None
+    aws_session_token: Optional[str] = None
+
 class AwsDeleteRequest(BaseModel):
     region: Optional[str] = None
     instance_id: Optional[str] = None
@@ -418,6 +513,9 @@ class AllCreateRequest(BaseModel):
     cluster_type: Optional[str] = None
     total_nodes: Optional[int] = None  # Total nodes to create, split evenly between GCP and AWS
 
+class AIRequest(BaseModel):
+    prompt: str
+    context: Optional[str] = None
 
 class AllListRequest(BaseModel):
     gcp_credentials: Optional[str] = None
@@ -467,6 +565,100 @@ def api_find(req: FindRequest):
         )
         return {"success": True, "results": results}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/ai/ask')
+def api_ai_ask(req: AIRequest):
+    """
+    Ask the AI for infrastructure advice or commands.
+    """
+    if not ai_client:
+        raise HTTPException(status_code=503, detail="AI service not configured (missing API key)")
+    
+    try:
+        system_prompt = """You are an expert Cloud Architect Assistant for 'HackEPS Cloud Manager'.
+Your goal is to help users design and manage hybrid cloud infrastructure on Google Cloud (GCP) and AWS.
+
+Capabilities of this platform:
+1. Create Hybrid Clusters: Can provision nodes on both GCP and AWS simultaneously.
+2. Docker Swarm: Automated setup of Swarm clusters (Manager on GCP, Workers on AWS/GCP).
+3. Kubernetes (K3s): Lightweight K8s clusters.
+4. Services: Redis, Portainer (management UI).
+5. Management: Start, Stop, Delete instances by ID or name.
+
+**CRITICAL INSTRUCTION - When to return JSON:**
+
+If the user's message contains ANY of these action keywords/phrases, you MUST return ONLY a JSON object:
+- CREATE: "create", "crea", "deploy", "despliega", "provision", "launch", "start"
+- DELETE: "delete", "elimina", "borra", "remove", "destroy", "terminate"
+- LIST: "list", "lista", "show", "muestra", "ver", "get", "dame"
+
+**JSON Format (NO markdown, NO backticks):**
+{"command": "create_cluster|delete_instance|list_instances", "parameters": {...}, "explanation": "I will..."}
+
+**Examples:**
+
+User: "create a swarm with 3 nodes"
+Response: {"command": "create_cluster", "parameters": {"cluster_type": "docker-swarm-manager", "total_nodes": 3, "gcp": {"name": "swarm-node-gcp", "zone": "europe-west1-b", "machine_type": "e2-medium"}, "aws": {"name": "swarm-node-aws", "region": "us-west-2", "instance_type": "t3.micro"}}, "explanation": "I will create a hybrid Docker Swarm cluster with 3 nodes."}
+
+User: "listame mis instancias" or "show my instances"
+Response: {"command": "list_instances", "parameters": {}, "explanation": "I will list all your instances on both GCP and AWS."}
+
+User: "delete gcp-cluster and aws-node"
+Response: {"command": "delete_instance", "parameters": {"instances": [{"name": "gcp-cluster", "provider": "gcp"}, {"name": "aws-node", "provider": "aws"}]}, "explanation": "I will delete the GCP instance 'gcp-cluster' and the AWS instance 'aws-node'."}
+
+User: "what is docker swarm?" (question, not action)
+Response: Docker Swarm is a container orchestration platform...
+
+**REMEMBER:** If user wants to DO something (action verb), return JSON. If user asks ABOUT something (question), return text.
+"""
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": req.prompt}
+        ]
+        
+        if req.context:
+            messages.insert(1, {"role": "system", "content": f"Current Context: {req.context}"})
+
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
+        
+        return {"response": response.choices[0].message.content}
+        
+    except Exception as e:
+        log_to_telegram(f"❌ AI Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/ai/execute')
+def api_ai_execute(command_json: dict):
+    """
+    Execute a command generated by the AI.
+    Expects: {"command": "...", "parameters": {...}, "explanation": "..."}
+    """
+    if not ai_client:
+        raise HTTPException(status_code=503, detail="AI service not configured")
+    
+    try:
+        credentials_path = os.path.join(os.path.dirname(__file__), 'credentials.json')
+        
+        result = execute_ai_command(
+            command_json=command_json,
+            api_all_create_func=api_all_create,
+            api_delete_func=api_delete,
+            api_aws_delete_func=api_aws_delete,
+            api_list_get_func=api_list_get,
+            api_aws_list_get_func=api_aws_list_get,
+            log_telegram_func=log_to_telegram,
+            credentials_path=credentials_path
+        )
+        
+        return result
+        
+    except Exception as e:
+        log_to_telegram(f"❌ AI Execution Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/create')
@@ -523,6 +715,15 @@ def api_create(req: CreateRequest):
                     msg += f"Cluster: {req.cluster_type or 'base'}\n"
                     msg += f"Ports: {ports_str}"
                     log_to_telegram(msg)
+                    
+                    # Store credentials
+                    _instance_credentials[name] = {
+                        'username': username,
+                        'password': password,
+                        'ip': ip,
+                        'provider': 'gcp',
+                        'zone': req.zone
+                    }
             else:
                 # Single instance
                 ip = result.get('public_ip', 'N/A')
@@ -537,6 +738,15 @@ def api_create(req: CreateRequest):
                 msg += f"Cluster: {req.cluster_type or 'base'}\n"
                 msg += f"Ports: {ports_str}"
                 log_to_telegram(msg)
+                
+                # Store credentials
+                _instance_credentials[req.name] = {
+                    'username': username,
+                    'password': password,
+                    'ip': ip,
+                    'provider': 'gcp',
+                    'zone': req.zone
+                }
         
         return result
     except Exception as e:
@@ -599,6 +809,36 @@ def api_delete(req: DeleteRequest):
         log_to_telegram(f"Error deleting GCP instance {req.name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get('/credentials')
+def api_get_credentials(instance_name: Optional[str] = None):
+    """
+    Get stored credentials for instances.
+    If instance_name is provided, returns credentials for that specific instance.
+    Otherwise, returns all stored credentials.
+    """
+    try:
+        if instance_name:
+            if instance_name in _instance_credentials:
+                return {
+                    "success": True,
+                    "instance_name": instance_name,
+                    "credentials": _instance_credentials[instance_name]
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"No credentials found for instance: {instance_name}"
+                }
+        else:
+            return {
+                "success": True,
+                "count": len(_instance_credentials),
+                "credentials": _instance_credentials
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get('/aws/list')
 def api_aws_list_get(region: Optional[str] = None, credentials_path: Optional[str] = None, state: Optional[str] = None):
     credentials_path = credentials_path or os.path.join(os.path.dirname(__file__), 'credentials_aws.json')
@@ -613,6 +853,14 @@ def api_aws_list_get(region: Optional[str] = None, credentials_path: Optional[st
                                        state=state)
         if not instances:
             return {"success": True, "count": 0, "instances": [], "message": "No se encontraron instancias con el prefijo t3- activas"}
+            
+        # Add specs to AWS instances
+        for inst in instances:
+            m_type = inst.get('InstanceType')
+            specs = get_instance_specs(m_type)
+            inst['cpu'] = specs['cpu']
+            inst['ram'] = specs['ram']
+            
         return {"success": True, "count": len(instances), "instances": instances}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -774,6 +1022,17 @@ def api_aws_create(req: AwsCreateRequest):
             msg += f"Cluster: {req.cluster_type or 'base'}\n"
             msg += f"Ports: {ports_str}"
             log_to_telegram(msg)
+            
+            # Store credentials (use instance name or ID)
+            instance_name = instance.get('Tags', [{}])[0].get('Value', instance_id) if instance.get('Tags') else instance_id
+            _instance_credentials[instance_name] = {
+                'username': username,
+                'password': password,
+                'ip': ip,
+                'provider': 'aws',
+                'region': req.region,
+                'instance_id': instance_id
+            }
         
         return response
     except Exception as e:
@@ -862,12 +1121,30 @@ def api_all_create(req: AllCreateRequest):
                 manager_ip = manager_result.get('public_ip')
                 manager_password = manager_result.get('password')
                 
-                log_to_telegram(f"⏳ Waiting for manager to initialize Swarm (this may take 2-3 minutes)...")
+                log_to_telegram(f"⏳ Waiting for manager to initialize Swarm (this may take 3-5 minutes)...")
                 
-                # Step 2: Wait and retrieve swarm info via SSH
+                # Store manager credentials
+                _instance_credentials[req.gcp.name] = {
+                    'username': 'ubuntu',
+                    'password': manager_password,
+                    'ip': manager_ip,
+                    'provider': 'gcp',
+                    'zone': req.gcp.zone,
+                    'role': 'manager'
+                }
+                
+                # Send credentials via Telegram
+                cred_msg = f"🔑 [Manager] Credenciales de acceso:\n"
+                cred_msg += f"Nombre: {req.gcp.name}\n"
+                cred_msg += f"IP: {manager_ip}\n"
+                cred_msg += f"Usuario: ubuntu\n"
+                cred_msg += f"Contraseña: {manager_password}\n"
+                cred_msg += f"SSH: ssh ubuntu@{manager_ip}"
+                log_to_telegram(cred_msg)
+                
+                # Step 2: Wait and retrieve swarm info via SSH (con mejoras de timeout)
                 try:
-                    swarm_info = get_swarm_info_via_ssh(manager_ip, password=manager_password, max_retries=15)
-                    # Use Public IP for workers to join
+                    swarm_info = get_swarm_info_via_ssh(manager_ip, password=manager_password, max_retries=20)
                     manager_public_ip = manager_ip
                     worker_token = swarm_info['worker_token']
                     
@@ -902,6 +1179,30 @@ def api_all_create(req: AllCreateRequest):
                         if isinstance(results['gcp'], dict) and 'created' in results['gcp']:
                             if isinstance(gcp_workers, dict) and 'created' in gcp_workers:
                                 results['gcp']['created'].extend(gcp_workers['created'])
+                        
+                        # Store and send credentials for GCP workers
+                        if isinstance(gcp_workers, dict) and 'created' in gcp_workers:
+                            for worker in gcp_workers['created']:
+                                worker_name = worker.get('name')
+                                worker_ip = worker.get('public_ip')
+                                worker_password = worker.get('password')
+                                
+                                _instance_credentials[worker_name] = {
+                                    'username': 'ubuntu',
+                                    'password': worker_password,
+                                    'ip': worker_ip,
+                                    'provider': 'gcp',
+                                    'zone': req.gcp.zone,
+                                    'role': 'worker'
+                                }
+                                
+                                cred_msg = f"🔑 [Worker GCP] Credenciales:\n"
+                                cred_msg += f"Nombre: {worker_name}\n"
+                                cred_msg += f"IP: {worker_ip}\n"
+                                cred_msg += f"Usuario: ubuntu\n"
+                                cred_msg += f"Contraseña: {worker_password}\n"
+                                cred_msg += f"SSH: ssh ubuntu@{worker_ip}"
+                                log_to_telegram(cred_msg)
                         
                     # Step 3: Create workers on AWS
                     if req.aws and req.aws.min_count > 0:
@@ -945,7 +1246,33 @@ def api_all_create(req: AllCreateRequest):
                         )
                         
                         results['aws'] = {'success': True, 'created': workers}
-                        log_to_telegram(f"✅ Swarm cluster created! Manager: {manager_public_ip}, Workers: {len(workers)}")
+                        
+                        # Store and send credentials for AWS workers
+                        for worker in workers:
+                            worker_ip = worker.get('PublicIpAddress')
+                            worker_password = worker.get('Password')
+                            instance_id = worker.get('InstanceId')
+                            worker_name = worker.get('Tags', [{}])[0].get('Value', instance_id) if worker.get('Tags') else instance_id
+                            
+                            _instance_credentials[worker_name] = {
+                                'username': 'ubuntu',
+                                'password': worker_password,
+                                'ip': worker_ip,
+                                'provider': 'aws',
+                                'region': req.aws.region,
+                                'instance_id': instance_id,
+                                'role': 'worker'
+                            }
+                            
+                            cred_msg = f"🔑 [Worker AWS] Credenciales:\n"
+                            cred_msg += f"Nombre: {worker_name}\n"
+                            cred_msg += f"IP: {worker_ip}\n"
+                            cred_msg += f"Usuario: ubuntu\n"
+                            cred_msg += f"Contraseña: {worker_password}\n"
+                            cred_msg += f"SSH: ssh ubuntu@{worker_ip}"
+                            log_to_telegram(cred_msg)
+                        
+                        log_to_telegram(f"✅ Swarm cluster created! Manager (GCP): {manager_public_ip}, Workers: {len(workers)} AWS + {req.gcp.count - 1 if req.gcp.count > 1 else 0} GCP")
                     
                 except Exception as e:
                     errors['gcp'] = f"Failed to retrieve swarm info: {e}"

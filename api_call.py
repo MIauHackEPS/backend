@@ -1,6 +1,10 @@
 import openai
+import os
+from dotenv import load_dotenv
 
-OPENAI_API_KEY="sk-qdzHCrt_rzQjiFiLfQFtyA" # Ask our OPENAI API KEY
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = openai.Client(api_key=OPENAI_API_KEY, base_url="https://innwater.eurecatprojects.com/lite-llm/")
 

@@ -3,7 +3,7 @@ import time
 import json
 from typing import Dict, Optional
 
-def get_swarm_info_via_ssh(host: str, username: str = 'ubuntu', password: Optional[str] = None, max_retries: int = 10) -> Dict:
+def get_swarm_info_via_ssh(host: str, username: str = 'ubuntu', password: Optional[str] = None, max_retries: int = 20) -> Dict:
     """
     SSH into manager node and retrieve swarm info from /tmp/swarm_info.json
     
@@ -16,14 +16,17 @@ def get_swarm_info_via_ssh(host: str, username: str = 'ubuntu', password: Option
     Returns:
         Dict with vpn_ip, worker_token, and manager_token
     """
+    print(f"Attempting to connect to {host} with user {username}")
+    
     for attempt in range(max_retries):
         try:
             # Create SSH client
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
-            # Connect
-            ssh.connect(host, username=username, password=password, timeout=10)
+            # Connect with increased timeout
+            print(f"Attempt {attempt + 1}/{max_retries}: Connecting to {host}...")
+            ssh.connect(host, username=username, password=password, timeout=30, banner_timeout=30)
             
             # Check if swarm_info.json exists
             stdin, stdout, stderr = ssh.exec_command('cat /tmp/swarm_info.json')
@@ -31,20 +34,24 @@ def get_swarm_info_via_ssh(host: str, username: str = 'ubuntu', password: Option
             error = stderr.read().decode()
             
             if error or not output:
-                print(f"Attempt {attempt + 1}/{max_retries}: Swarm info not ready yet...")
+                print(f"Attempt {attempt + 1}/{max_retries}: Swarm info not ready yet (file not found or empty)")
                 ssh.close()
-                time.sleep(10)  # Wait 10 seconds before retry
+                time.sleep(15)  # Wait 15 seconds before retry
                 continue
             
             # Parse JSON
             swarm_info = json.loads(output)
             ssh.close()
             
+            print(f"✅ Successfully retrieved swarm info from {host}")
             return swarm_info
             
+        except paramiko.AuthenticationException as e:
+            print(f"Attempt {attempt + 1}/{max_retries}: Authentication failed - instance may still be initializing")
+            time.sleep(15)
         except Exception as e:
             print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-            time.sleep(10)
+            time.sleep(15)
     
     raise Exception(f"Failed to retrieve swarm info after {max_retries} attempts")
 
