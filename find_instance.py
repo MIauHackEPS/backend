@@ -40,7 +40,8 @@ def find_instances(project_id, zone, region, num_cpus, num_ram_gb, max_results=2
             ram_gb = machine_type.memory_mb / 1024
             
             # Filtrar por requisitos
-            if machine_type.guest_cpus == num_cpus and ram_gb == num_ram_gb :
+            # Excluir instancias ARM (t2a) para evitar conflictos con imágenes x86
+            if machine_type.guest_cpus == num_cpus and ram_gb == num_ram_gb and 't2a' not in machine_type.name:
                 machine_types.append({
                     'name': machine_type.name,
                     'cpus': machine_type.guest_cpus,

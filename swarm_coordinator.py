@@ -49,34 +49,46 @@ def get_swarm_info_via_ssh(host: str, username: str = 'ubuntu', password: Option
     raise Exception(f"Failed to retrieve swarm info after {max_retries} attempts")
 
 
-def prepare_worker_script(base_script: str, tailscale_key: str, worker_token: str, manager_ip: str) -> str:
+def prepare_worker_script(base_script: str, worker_token: str, manager_ip: str, telegram_token: str = None, telegram_chat_id: str = None) -> str:
     """
     Prepare worker startup script with actual values
     
     Args:
         base_script: Base worker script template
-        tailscale_key: Tailscale auth key
         worker_token: Docker Swarm worker token
-        manager_ip: Manager VPN IP address
+        manager_ip: Manager Public IP address
+        telegram_token: Telegram bot token for logging
+        telegram_chat_id: Telegram chat ID for logging
     
     Returns:
         Complete worker startup script
     """
-    script = base_script.replace('TS_AUTHKEY_PLACEHOLDER', tailscale_key)
-    script = script.replace('WORKER_TOKEN_PLACEHOLDER', worker_token)
+    script = base_script.replace('WORKER_TOKEN_PLACEHOLDER', worker_token)
     script = script.replace('MANAGER_IP_PLACEHOLDER', manager_ip)
+    
+    if telegram_token and telegram_chat_id:
+        script = script.replace('TELEGRAM_BOT_TOKEN_PLACEHOLDER', telegram_token)
+        script = script.replace('TELEGRAM_CHAT_ID_PLACEHOLDER', telegram_chat_id)
+        
     return script
 
 
-def prepare_manager_script(base_script: str, tailscale_key: str) -> str:
+def prepare_manager_script(base_script: str, telegram_token: str = None, telegram_chat_id: str = None) -> str:
     """
-    Prepare manager startup script with Tailscale key
+    Prepare manager startup script
     
     Args:
         base_script: Base manager script template
-        tailscale_key: Tailscale auth key
+        telegram_token: Telegram bot token for logging
+        telegram_chat_id: Telegram chat ID for logging
     
     Returns:
         Complete manager startup script
     """
-    return base_script.replace('TS_AUTHKEY_PLACEHOLDER', tailscale_key)
+    script = base_script
+    
+    if telegram_token and telegram_chat_id:
+        script = script.replace('TELEGRAM_BOT_TOKEN_PLACEHOLDER', telegram_token)
+        script = script.replace('TELEGRAM_CHAT_ID_PLACEHOLDER', telegram_chat_id)
+        
+    return script

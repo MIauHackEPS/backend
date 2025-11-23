@@ -88,7 +88,21 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
             md_items = list(items)
             startup = f"""#!/bin/bash
 exec > /var/log/startup_script.log 2>&1
+set -x  # Enable debug mode
 set -e
+
+# Flush firewall rules to ensure ports are open
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+
+# Ensure ubuntu user exists and has sudo access
 if id -u ubuntu >/dev/null 2>&1; then
     echo "ubuntu:{instance_password}" | chpasswd
 else
@@ -96,6 +110,8 @@ else
     echo "ubuntu:{instance_password}" | chpasswd
 fi
 usermod -aG sudo ubuntu || true
+
+# Configure SSH
 sed -i 's/^#PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
 sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
 if [ -d /etc/ssh/sshd_config.d ]; then

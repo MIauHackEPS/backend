@@ -101,6 +101,40 @@ docker swarm init || true
 docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
 """,
     "docker-swarm-manager": """
+
+set -x
+export DEBIAN_FRONTEND=noninteractive
+
+# Telegram logging function
+log_telegram() {
+    MSG="$1"
+    curl -s -X POST https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage \
+        -d chat_id={TELEGRAM_CHAT_ID} \
+        -d text="🔹 [GCP-Manager] $MSG" >/dev/null || true
+}
+
+log_telegram "Starting initialization..."
+
+# Flush firewall and allow all
+iptables -F
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+ufw disable || true
+
+# Explicitly allow Swarm and Portainer ports
+iptables -A INPUT -p tcp --dport 2377 -j ACCEPT
+iptables -A INPUT -p tcp --dport 7946 -j ACCEPT
+iptables -A INPUT -p udp --dport 7946 -j ACCEPT
+iptables -A INPUT -p udp --dport 4789 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9443 -j ACCEPT
+iptables -A INPUT -p tcp --dport 8000 -j ACCEPT
+
+# Wait for apt lock
+while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do sleep 1 ; done
+while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ; do sleep 1 ; done
+
+log_telegram "Installing Docker and dependencies..."
 apt-get update
 apt-get install -y docker.io docker-compose curl jq
 
@@ -108,33 +142,27 @@ systemctl enable docker
 systemctl start docker
 usermod -aG docker ubuntu
 
-# Disable firewall to allow Swarm/Tailscale traffic
-ufw disable || true
+# Get Public IP from metadata
+PUBLIC_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+log_telegram "Public IP detected: ${PUBLIC_IP}"
 
-# Install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sh
-
-# Join Tailscale network
-tailscale up --authkey="TS_AUTHKEY_PLACEHOLDER" --ssh --accept-routes
-
-# Wait for Tailscale IP
-timeout 60s bash -c 'until ip -4 addr show tailscale0 | grep -q "inet "; do sleep 2; done'
-VPN_IP=$(ip -4 addr show tailscale0 | awk '/inet /{print $2}' | cut -d/ -f1)
+# Initialize Swarm with Public IP
+log_telegram "Initializing Swarm on ${PUBLIC_IP}..."
+docker swarm init --advertise-addr ${PUBLIC_IP} || true
 
 # Wait for docker to be ready
 timeout 60s bash -c 'until docker info; do sleep 2; done'
 
-# Initialize Swarm with VPN IP
-docker swarm init --advertise-addr ${VPN_IP} || true
+
 
 # Get tokens
 WORKER_TOKEN=$(docker swarm join-token -q worker)
 MANAGER_TOKEN=$(docker swarm join-token -q manager)
 
-# Save tokens and VPN IP to file
+# Save tokens and Public IP to file
 cat > /tmp/swarm_info.json <<EOF
 {
-  "vpn_ip": "${VPN_IP}",
+  "vpn_ip": "${PUBLIC_IP}",
   "worker_token": "${WORKER_TOKEN}",
   "manager_token": "${MANAGER_TOKEN}"
 }
@@ -145,9 +173,36 @@ docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data \
   portainer/portainer-ce:latest
 
-echo "Swarm manager initialized. VPN IP: ${VPN_IP}"
+# Wait for Portainer to be ready
+log_telegram "Waiting for Portainer to start..."
+timeout 60s bash -c 'until curl -k -s https://localhost:9443 >/dev/null; do sleep 2; done'
+
+log_telegram "✅ EVERYTHING READY! Access Portainer at: https://${PUBLIC_IP}:9443"
+echo "Swarm manager initialized. Public IP: ${PUBLIC_IP}"
 """,
     "docker-swarm-worker": """
+set -x
+export DEBIAN_FRONTEND=noninteractive
+
+# Telegram logging function
+log_telegram() {
+    MSG="$1"
+    curl -s -X POST https://api.telegram.org/botTELEGRAM_BOT_TOKEN_PLACEHOLDER/sendMessage \
+        -d chat_id=TELEGRAM_CHAT_ID_PLACEHOLDER \
+        -d text="🔸 [AWS-Worker] $MSG" >/dev/null || true
+}
+
+log_telegram "Starting initialization..."
+
+# Flush firewall
+iptables -F
+ufw disable || true
+
+# Wait for apt lock
+while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do sleep 1 ; done
+while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ; do sleep 1 ; done
+
+log_telegram "Installing Docker and dependencies..."
 apt-get update
 apt-get install -y docker.io docker-compose curl
 
@@ -155,23 +210,16 @@ systemctl enable docker
 systemctl start docker
 usermod -aG docker ubuntu
 
-# Disable firewall to allow Swarm/Tailscale traffic
-ufw disable || true
 
-# Install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sh
-
-# Join Tailscale network
-tailscale up --authkey="TS_AUTHKEY_PLACEHOLDER" --ssh --accept-routes
-
-# Wait for Tailscale IP
-timeout 60s bash -c 'until ip -4 addr show tailscale0 | grep -q "inet "; do sleep 2; done'
 
 # Wait for docker to be ready
 timeout 60s bash -c 'until docker info; do sleep 2; done'
 
+log_telegram "Joining Swarm..."
 # Join swarm (manager IP and token will be replaced)
 docker swarm join --token WORKER_TOKEN_PLACEHOLDER MANAGER_IP_PLACEHOLDER:2377
+
+log_telegram "Joined swarm successfully!"
 
 echo "Joined swarm as worker"
 """,
@@ -207,14 +255,14 @@ SERVICE_INFO = {
         "instructions": "Docker Swarm initialized. Portainer UI available at https://<IP>:9443"
     },
     "docker-swarm-manager": {
-        "ports": [2377, 7946, 4789, 9443, 8000],
-        "protocol": "tcp/udp",
-        "instructions": "Docker Swarm Manager with Tailscale VPN. Portainer at https://<VPN_IP>:9443"
+        "ports": [2377, 7946, 4789, 8000, 9443],
+        "protocol": "tcp",
+        "instructions": "Docker Swarm Manager (Public IP). Portainer at https://<IP>:9443"
     },
     "docker-swarm-worker": {
         "ports": [2377, 7946, 4789],
-        "protocol": "tcp/udp",
-        "instructions": "Docker Swarm Worker with Tailscale VPN. Connected to manager."
+        "protocol": "tcp",
+        "instructions": "Docker Swarm Worker. Connected to manager via Public IP."
     },
     "redis": {
         "ports": [6379],
@@ -780,12 +828,9 @@ def api_all_create(req: AllCreateRequest):
         
         log_to_telegram(f"📊 Node distribution: {gcp_count} GCP + {aws_count} AWS = {req.total_nodes} total")
     
-    # Special handling for docker-swarm-manager (Tailscale VPN cluster)
-    if req.cluster_type == "docker-swarm-manager":
-        if not TAILSCALE_AUTH_KEY:
-            raise HTTPException(status_code=500, detail="TAILSCALE_AUTH_KEY not configured in environment")
-        
-        log_to_telegram(f"🔧 Creating Tailscale-based Docker Swarm cluster")
+    # Special handling for docker-swarm-manager (Public IP cluster)
+    if req.cluster_type in ["docker-swarm-manager", "docker-swarm"]:
+        log_to_telegram(f"🔧 Creating Public IP-based Docker Swarm cluster")
         
         # Step 1: Create manager (first GCP node)
         if req.gcp:
@@ -793,8 +838,12 @@ def api_all_create(req: AllCreateRequest):
                 credentials_path = req.gcp.credentials or os.path.join(os.path.dirname(__file__), 'credentials.json')
                 creds = _set_credentials_and_load(credentials_path)
                 
-                # Prepare manager script with Tailscale key
-                manager_script = prepare_manager_script(STARTUP_SCRIPTS["docker-swarm-manager"], TAILSCALE_AUTH_KEY)
+                # Prepare manager script with Telegram logging
+                manager_script = prepare_manager_script(
+                    STARTUP_SCRIPTS["docker-swarm-manager"],
+                    telegram_token=TELEGRAM_BOT_TOKEN,
+                    telegram_chat_id=TELEGRAM_CHAT_ID
+                )
                 
                 log_to_telegram(f"📍 Creating Swarm manager on GCP: {req.gcp.name}")
                 
@@ -818,11 +867,42 @@ def api_all_create(req: AllCreateRequest):
                 # Step 2: Wait and retrieve swarm info via SSH
                 try:
                     swarm_info = get_swarm_info_via_ssh(manager_ip, password=manager_password, max_retries=15)
-                    manager_vpn_ip = swarm_info['vpn_ip']
+                    # Use Public IP for workers to join
+                    manager_public_ip = manager_ip
                     worker_token = swarm_info['worker_token']
                     
-                    log_to_telegram(f"✅ Manager ready! VPN IP: {manager_vpn_ip}")
+                    log_to_telegram(f"✅ Manager ready! Public IP: {manager_public_ip}")
                     
+                    # Step 2.5: Create remaining GCP workers if count > 1
+                    if req.gcp and req.gcp.count > 1:
+                        remaining_gcp = req.gcp.count - 1
+                        log_to_telegram(f"📍 Creating {remaining_gcp} additional Swarm workers on GCP")
+                        
+                        # Prepare worker script
+                        worker_script = prepare_worker_script(
+                            STARTUP_SCRIPTS["docker-swarm-worker"],
+                            worker_token,
+                            manager_public_ip,
+                            telegram_token=TELEGRAM_BOT_TOKEN,
+                            telegram_chat_id=TELEGRAM_CHAT_ID
+                        )
+                        
+                        gcp_workers = create_instance(
+                            project_id=creds['project_id'],
+                            zone=req.gcp.zone,
+                            instance_name=f"{req.gcp.name}-worker",
+                            machine_type=req.gcp.machine_type,
+                            ssh_key=req.gcp.ssh_key,
+                            password=getattr(req.gcp, 'password', None),
+                            count=remaining_gcp,
+                            startup_script=worker_script
+                        )
+                        
+                        # Merge results
+                        if isinstance(results['gcp'], dict) and 'created' in results['gcp']:
+                            if isinstance(gcp_workers, dict) and 'created' in gcp_workers:
+                                results['gcp']['created'].extend(gcp_workers['created'])
+                        
                     # Step 3: Create workers on AWS
                     if req.aws and req.aws.min_count > 0:
                         aws_creds = {}
@@ -839,9 +919,10 @@ def api_all_create(req: AllCreateRequest):
                         # Prepare worker script
                         worker_script = prepare_worker_script(
                             STARTUP_SCRIPTS["docker-swarm-worker"],
-                            TAILSCALE_AUTH_KEY,
                             worker_token,
-                            manager_vpn_ip
+                            manager_public_ip,
+                            telegram_token=TELEGRAM_BOT_TOKEN,
+                            telegram_chat_id=TELEGRAM_CHAT_ID
                         )
                         
                         log_to_telegram(f"📍 Creating {req.aws.min_count} Swarm workers on AWS")
@@ -864,7 +945,7 @@ def api_all_create(req: AllCreateRequest):
                         )
                         
                         results['aws'] = {'success': True, 'created': workers}
-                        log_to_telegram(f"✅ Swarm cluster created! Manager: {manager_vpn_ip}, Workers: {len(workers)}")
+                        log_to_telegram(f"✅ Swarm cluster created! Manager: {manager_public_ip}, Workers: {len(workers)}")
                     
                 except Exception as e:
                     errors['gcp'] = f"Failed to retrieve swarm info: {e}"
