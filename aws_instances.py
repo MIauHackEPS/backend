@@ -56,6 +56,34 @@ def list_instances_aws(region_name=None, aws_access_key=None, aws_secret_key=Non
                     'LaunchTime': inst.get('LaunchTime').isoformat() if inst.get('LaunchTime') else None,
                     'Tags': tags
                 })
+        # Enrich instances with vcpu/memory info by describing the instance types present
+        try:
+            instance_types = list({inst.get('InstanceType') for inst in instances if inst.get('InstanceType')})
+            if instance_types:
+                desc = client.describe_instance_types(InstanceTypes=instance_types)
+                type_map = {}
+                for it in desc.get('InstanceTypes', []):
+                    vcpus = None
+                    mem_gb = None
+                    vcpu_info = it.get('VCpuInfo')
+                    mem_info = it.get('MemoryInfo')
+                    if vcpu_info:
+                        vcpus = vcpu_info.get('DefaultVCpus')
+                    if mem_info:
+                        mem_mib = mem_info.get('SizeInMiB')
+                        if mem_mib is not None:
+                            mem_gb = round(mem_mib / 1024, 2)
+                    type_map[it.get('InstanceType')] = {'vcpus': vcpus, 'memory_gb': mem_gb}
+
+                # attach to instances
+                for inst in instances:
+                    t = inst.get('InstanceType')
+                    if t and t in type_map:
+                        inst.update(type_map[t])
+        except Exception:
+            # If describing instance types fails, return instances without vcpu/memory enrichment
+            pass
+
         return instances
     except Exception as e:
         raise RuntimeError(f"Error listing AWS instances: {e}")
@@ -75,6 +103,31 @@ def list_instances_aws_all(region_name=None, aws_access_key=None, aws_secret_key
                     'LaunchTime': inst.get('LaunchTime').isoformat() if inst.get('LaunchTime') else None,
                     'Tags': inst.get('Tags', [])
                 })
+        # attempt to enrich with vcpu/memory
+        try:
+            instance_types = list({inst.get('InstanceType') for inst in instances if inst.get('InstanceType')})
+            if instance_types:
+                desc = client.describe_instance_types(InstanceTypes=instance_types)
+                type_map = {}
+                for it in desc.get('InstanceTypes', []):
+                    vcpus = None
+                    mem_gb = None
+                    vcpu_info = it.get('VCpuInfo')
+                    mem_info = it.get('MemoryInfo')
+                    if vcpu_info:
+                        vcpus = vcpu_info.get('DefaultVCpus')
+                    if mem_info:
+                        mem_mib = mem_info.get('SizeInMiB')
+                        if mem_mib is not None:
+                            mem_gb = round(mem_mib / 1024, 2)
+                    type_map[it.get('InstanceType')] = {'vcpus': vcpus, 'memory_gb': mem_gb}
+                for inst in instances:
+                    t = inst.get('InstanceType')
+                    if t and t in type_map:
+                        inst.update(type_map[t])
+        except Exception:
+            pass
+
         return instances
     except Exception as e:
         raise RuntimeError(f"Error listing all AWS instances: {e}")
@@ -107,6 +160,31 @@ def find_instances_aws(name: Optional[str] = None, region_name=None, aws_access_
                     'LaunchTime': inst.get('LaunchTime').isoformat() if inst.get('LaunchTime') else None,
                     'Tags': tags
                 })
+        # enrich with instance-type info
+        try:
+            instance_types = list({inst.get('InstanceType') for inst in instances if inst.get('InstanceType')})
+            if instance_types:
+                desc = client.describe_instance_types(InstanceTypes=instance_types)
+                type_map = {}
+                for it in desc.get('InstanceTypes', []):
+                    vcpus = None
+                    mem_gb = None
+                    vcpu_info = it.get('VCpuInfo')
+                    mem_info = it.get('MemoryInfo')
+                    if vcpu_info:
+                        vcpus = vcpu_info.get('DefaultVCpus')
+                    if mem_info:
+                        mem_mib = mem_info.get('SizeInMiB')
+                        if mem_mib is not None:
+                            mem_gb = round(mem_mib / 1024, 2)
+                    type_map[it.get('InstanceType')] = {'vcpus': vcpus, 'memory_gb': mem_gb}
+                for inst in instances:
+                    t = inst.get('InstanceType')
+                    if t and t in type_map:
+                        inst.update(type_map[t])
+        except Exception:
+            pass
+
         return instances
     except Exception as e:
         raise RuntimeError(f"Error finding AWS instances: {e}")
