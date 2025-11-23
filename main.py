@@ -1,3 +1,5 @@
+import urllib.request
+import urllib.parse
 import argparse
 import json
 import os
@@ -15,6 +17,55 @@ from typing import Optional, List
 import secrets
 import string
 from google.cloud import compute_v1
+from dotenv import load_dotenv
+import time
+from datetime import datetime, timedelta
+from swarm_coordinator import get_swarm_info_via_ssh, prepare_worker_script, prepare_manager_script
+
+load_dotenv()
+
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+
+# Tailscale Configuration
+TAILSCALE_AUTH_KEY = os.environ.get('TAILSCALE_AUTH_KEY')
+
+# Cache for instance types (TTL: 5 minutes)
+_instance_types_cache = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+def _get_cache_key(provider: str, zone_or_region: str, cpus: int, ram: int) -> str:
+    """Generate cache key for instance types"""
+    return f"{provider}:{zone_or_region}:{cpus}:{ram}"
+
+def _get_from_cache(cache_key: str):
+    """Get cached result if not expired"""
+    if cache_key in _instance_types_cache:
+        cached_data, timestamp = _instance_types_cache[cache_key]
+        if datetime.now() - timestamp < timedelta(seconds=CACHE_TTL_SECONDS):
+            return cached_data
+        else:
+            # Expired, remove from cache
+            del _instance_types_cache[cache_key]
+    return None
+
+def _set_cache(cache_key: str, data):
+    """Store data in cache with timestamp"""
+    _instance_types_cache[cache_key] = (data, datetime.now())
+
+def log_to_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"Telegram logger not configured. Message: {message}")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode()
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Failed to send Telegram log: {e}")
 
 app = FastAPI()
 
@@ -33,13 +84,96 @@ app.add_middleware(
 # --- Startup Scripts ---
 STARTUP_SCRIPTS = {
     "kubernetes": """
+apt-get update
+apt-get install -y curl
 curl -sfL https://get.k3s.io | sh -
 """,
     "docker-swarm": """
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
+apt-get update
+apt-get install -y docker.io docker-compose
+systemctl enable docker
+systemctl start docker
 usermod -aG docker ubuntu
+# Wait for docker to be ready
+timeout 60s bash -c 'until docker info; do sleep 2; done'
 docker swarm init || true
+# Install Portainer for Swarm management UI
+docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
+""",
+    "docker-swarm-manager": """
+apt-get update
+apt-get install -y docker.io docker-compose curl jq
+
+systemctl enable docker
+systemctl start docker
+usermod -aG docker ubuntu
+
+# Disable firewall to allow Swarm/Tailscale traffic
+ufw disable || true
+
+# Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Join Tailscale network
+tailscale up --authkey="TS_AUTHKEY_PLACEHOLDER" --ssh --accept-routes
+
+# Wait for Tailscale IP
+timeout 60s bash -c 'until ip -4 addr show tailscale0 | grep -q "inet "; do sleep 2; done'
+VPN_IP=$(ip -4 addr show tailscale0 | awk '/inet /{print $2}' | cut -d/ -f1)
+
+# Wait for docker to be ready
+timeout 60s bash -c 'until docker info; do sleep 2; done'
+
+# Initialize Swarm with VPN IP
+docker swarm init --advertise-addr ${VPN_IP} || true
+
+# Get tokens
+WORKER_TOKEN=$(docker swarm join-token -q worker)
+MANAGER_TOKEN=$(docker swarm join-token -q manager)
+
+# Save tokens and VPN IP to file
+cat > /tmp/swarm_info.json <<EOF
+{
+  "vpn_ip": "${VPN_IP}",
+  "worker_token": "${WORKER_TOKEN}",
+  "manager_token": "${MANAGER_TOKEN}"
+}
+EOF
+
+# Install Portainer
+docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data \
+  portainer/portainer-ce:latest
+
+echo "Swarm manager initialized. VPN IP: ${VPN_IP}"
+""",
+    "docker-swarm-worker": """
+apt-get update
+apt-get install -y docker.io docker-compose curl
+
+systemctl enable docker
+systemctl start docker
+usermod -aG docker ubuntu
+
+# Disable firewall to allow Swarm/Tailscale traffic
+ufw disable || true
+
+# Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Join Tailscale network
+tailscale up --authkey="TS_AUTHKEY_PLACEHOLDER" --ssh --accept-routes
+
+# Wait for Tailscale IP
+timeout 60s bash -c 'until ip -4 addr show tailscale0 | grep -q "inet "; do sleep 2; done'
+
+# Wait for docker to be ready
+timeout 60s bash -c 'until docker info; do sleep 2; done'
+
+# Join swarm (manager IP and token will be replaced)
+docker swarm join --token WORKER_TOKEN_PLACEHOLDER MANAGER_IP_PLACEHOLDER:2377
+
+echo "Joined swarm as worker"
 """,
     "redis": """
 apt-get update
@@ -50,11 +184,48 @@ sed -i 's/bind 127.0.0.1 ::1/bind 0.0.0.0/' /etc/redis/redis.conf
 systemctl restart redis-server
 """,
     "portainer": """
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
+apt-get update
+apt-get install -y docker.io docker-compose
+systemctl enable docker
+systemctl start docker
 usermod -aG docker ubuntu
+# Wait for docker to be ready
+timeout 60s bash -c 'until docker info; do sleep 2; done'
 docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
 """
+}
+
+SERVICE_INFO = {
+    "kubernetes": {
+        "ports": [6443],
+        "protocol": "tcp",
+        "instructions": "K3s is installing. Access via port 6443. Config at /etc/rancher/k3s/k3s.yaml"
+    },
+    "docker-swarm": {
+        "ports": [2377, 7946, 4789, 9443, 8000],
+        "protocol": "tcp/udp",
+        "instructions": "Docker Swarm initialized. Portainer UI available at https://<IP>:9443"
+    },
+    "docker-swarm-manager": {
+        "ports": [2377, 7946, 4789, 9443, 8000],
+        "protocol": "tcp/udp",
+        "instructions": "Docker Swarm Manager with Tailscale VPN. Portainer at https://<VPN_IP>:9443"
+    },
+    "docker-swarm-worker": {
+        "ports": [2377, 7946, 4789],
+        "protocol": "tcp/udp",
+        "instructions": "Docker Swarm Worker with Tailscale VPN. Connected to manager."
+    },
+    "redis": {
+        "ports": [6379],
+        "protocol": "tcp",
+        "instructions": "Redis server running on port 6379."
+    },
+    "portainer": {
+        "ports": [9443, 8000],
+        "protocol": "tcp",
+        "instructions": "Portainer UI available at https://<IP>:9443"
+    }
 }
 
 def load_credentials(credentials_file):
@@ -124,7 +295,7 @@ class FindRequest(BaseModel):
     ram: int
 
 class CreateRequest(BaseModel):
-    credentials: str
+    credentials: Optional[str] = None
     zone: str
     name: str
     machine_type: str
@@ -197,6 +368,8 @@ class AllCreateRequest(BaseModel):
     gcp: Optional[CreateRequest] = None
     aws: Optional[AwsCreateRequest] = None
     cluster_type: Optional[str] = None
+    total_nodes: Optional[int] = None  # Total nodes to create, split evenly between GCP and AWS
+
 
 class AllListRequest(BaseModel):
     gcp_credentials: Optional[str] = None
@@ -250,7 +423,10 @@ def api_find(req: FindRequest):
 
 @app.post('/create')
 def api_create(req: CreateRequest):
+    if not req.credentials:
+        raise HTTPException(status_code=400, detail="credentials is required for /create endpoint")
     creds = _set_credentials_and_load(req.credentials)
+    log_to_telegram(f"🚀 Creating GCP instance: {req.name} ({req.cluster_type or 'base'})")
     try:
         result = create_instance(
             project_id=creds['project_id'],
@@ -265,8 +441,58 @@ def api_create(req: CreateRequest):
             image=getattr(req, 'image', None),
             startup_script=STARTUP_SCRIPTS.get(req.cluster_type) if req.cluster_type else None
         )
+        if req.cluster_type and req.cluster_type in SERVICE_INFO:
+            if isinstance(result, dict) and "created" in result:
+                 # Multiple instances
+                 for item in result["created"]:
+                     item["service_info"] = SERVICE_INFO[req.cluster_type]
+            elif isinstance(result, dict):
+                 # Single instance
+                 result["service_info"] = SERVICE_INFO[req.cluster_type]
+        
+        # Debug: print result structure
+        print(f"DEBUG GCP Result: {result}")
+        
+        # Enhanced Telegram logging
+        ports = SERVICE_INFO.get(req.cluster_type, {}).get('ports', []) if req.cluster_type else []
+        ports_str = ', '.join(map(str, ports)) if ports else 'N/A'
+        
+        if isinstance(result, dict):
+            # Check if it's a multiple instances response
+            if "created" in result and isinstance(result["created"], list):
+                # Multiple instances
+                for item in result["created"]:
+                    ip = item.get('public_ip', 'N/A')
+                    password = item.get('password', 'N/A')
+                    username = item.get('username', 'ubuntu')
+                    name = item.get('name', req.name)
+                    
+                    msg = f"✅ GCP Instance Created!\n"
+                    msg += f"Name: {name}\n"
+                    msg += f"IP: {ip}\n"
+                    msg += f"User: {username}\n"
+                    msg += f"Password: {password}\n"
+                    msg += f"Cluster: {req.cluster_type or 'base'}\n"
+                    msg += f"Ports: {ports_str}"
+                    log_to_telegram(msg)
+            else:
+                # Single instance
+                ip = result.get('public_ip', 'N/A')
+                password = result.get('password', 'N/A')
+                username = result.get('username', 'ubuntu')
+                
+                msg = f"✅ GCP Instance Created!\n"
+                msg += f"Name: {req.name}\n"
+                msg += f"IP: {ip}\n"
+                msg += f"User: {username}\n"
+                msg += f"Password: {password}\n"
+                msg += f"Cluster: {req.cluster_type or 'base'}\n"
+                msg += f"Ports: {ports_str}"
+                log_to_telegram(msg)
+        
         return result
     except Exception as e:
+        log_to_telegram(f"❌ Error creating GCP instance {req.name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/list')
@@ -306,6 +532,7 @@ def api_list_get(zone: Optional[str] = None, credentials_path: Optional[str] = N
 @app.post('/delete')
 def api_delete(req: DeleteRequest):
     creds = _set_credentials_and_load(req.credentials)
+    log_to_telegram(f"Deleting GCP instance: {req.name}")
     try:
         if req.zone:
             success = delete_instance(
@@ -318,8 +545,10 @@ def api_delete(req: DeleteRequest):
                 project_id=creds['project_id'],
                 instance_name=req.name
             )
+        log_to_telegram(f"GCP instance deleted: {req.name} (Success: {success})")
         return {"success": bool(success)}
     except Exception as e:
+        log_to_telegram(f"Error deleting GCP instance {req.name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/aws/list')
@@ -396,29 +625,53 @@ def api_aws_find(req: AwsFindRequest):
 def api_gcp_instance_types(zone: Optional[str] = None, credentials: Optional[str] = None, cpus: Optional[int] = None, ram_gb: Optional[int] = None, region: Optional[str] = None):
     if not zone:
         raise HTTPException(status_code=400, detail="zone is required")
+    
+    # Check cache first
+    cache_key = _get_cache_key('gcp', zone, int(cpus or 1), int(ram_gb or 1))
+    cached_result = _get_from_cache(cache_key)
+    if cached_result is not None:
+        return cached_result
+    
     credentials_path = credentials or os.path.join(os.path.dirname(__file__), 'credentials.json')
     creds = _set_credentials_and_load(credentials_path)
     try:
         results = find_instances(project_id=creds['project_id'], zone=zone, region=region or '', num_cpus=int(cpus or 1), num_ram_gb=int(ram_gb or 1))
-        return {"success": True, "count": len(results), "instance_types": results}
+        response = {"success": True, "count": len(results), "instance_types": results}
+        
+        # Cache the result
+        _set_cache(cache_key, response)
+        
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/instance-types/aws')
 def api_aws_instance_types(region: Optional[str] = None, min_vcpus: Optional[int] = None, min_memory_gb: Optional[float] = None, aws_access_key: Optional[str] = None, aws_secret_key: Optional[str] = None, aws_session_token: Optional[str] = None):
+    # Check cache first
+    region_name = region or 'us-west-2'
+    cache_key = _get_cache_key('aws', region_name, int(min_vcpus or 1), int(min_memory_gb or 1))
+    cached_result = _get_from_cache(cache_key)
+    if cached_result is not None:
+        return cached_result
+    
     try:
         aws_creds = _load_aws_credentials_file()
         aws_access = aws_access_key or aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key')
         aws_secret = aws_secret_key or aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key')
         aws_token = aws_session_token or aws_creds.get('aws_session_token')
-        region_name = region or aws_creds.get('region') or 'us-west-2'
         results = find_instance_types_aws(region_name=region_name, min_vcpus=int(min_vcpus or 1), min_memory_gb=float(min_memory_gb or 1.0), aws_access_key=aws_access, aws_secret_key=aws_secret, aws_session_token=aws_token)
-        return {"success": True, "count": len(results), "instance_types": results}
+        response = {"success": True, "count": len(results), "instance_types": results}
+        
+        # Cache the result
+        _set_cache(cache_key, response)
+        
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/aws/create')
 def api_aws_create(req: AwsCreateRequest):
+    log_to_telegram(f"🚀 Creating AWS instance: {req.name} ({req.cluster_type or 'base'})")
     try:
         aws_creds = {}
         if req.aws_access_key or req.aws_secret_key or req.aws_session_token:
@@ -449,12 +702,39 @@ def api_aws_create(req: AwsCreateRequest):
             aws_session_token=aws_creds.get('aws_session_token'),
             user_data_script=script
         )
-        return {"success": True, "created": created}
+
+        response = {"success": True, "created": created}
+        if req.cluster_type and req.cluster_type in SERVICE_INFO:
+            for item in created:
+                item["service_info"] = SERVICE_INFO[req.cluster_type]
+        
+        # Enhanced Telegram logging
+        ports = SERVICE_INFO.get(req.cluster_type, {}).get('ports', []) if req.cluster_type else []
+        ports_str = ', '.join(map(str, ports)) if ports else 'N/A'
+        
+        for instance in created:
+            ip = instance.get('PublicIpAddress', 'N/A')
+            password = instance.get('Password', 'N/A')
+            username = instance.get('username', 'ubuntu')
+            instance_id = instance.get('InstanceId', 'N/A')
+            
+            msg = f"✅ AWS Instance Created!\n"
+            msg += f"ID: {instance_id}\n"
+            msg += f"IP: {ip}\n"
+            msg += f"User: {username}\n"
+            msg += f"Password: {password}\n"
+            msg += f"Cluster: {req.cluster_type or 'base'}\n"
+            msg += f"Ports: {ports_str}"
+            log_to_telegram(msg)
+        
+        return response
     except Exception as e:
+        log_to_telegram(f"❌ Error creating AWS instance {req.name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/aws/delete')
 def api_aws_delete(req: AwsDeleteRequest):
+    log_to_telegram(f"Deleting AWS instance: {req.instance_id or req.name}")
     try:
         aws_creds = {}
         if req.aws_access_key or req.aws_secret_key or req.aws_session_token:
@@ -474,19 +754,135 @@ def api_aws_delete(req: AwsDeleteRequest):
             aws_secret_key=aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key'),
             aws_session_token=aws_creds.get('aws_session_token')
         )
+        log_to_telegram(f"AWS instance deleted: {req.instance_id or req.name} (Result: {result})")
         return {"success": True, "result": result}
     except Exception as e:
+        log_to_telegram(f"Error deleting AWS instance {req.instance_id or req.name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/all/create')
 def api_all_create(req: AllCreateRequest):
+    log_to_telegram(f"🚀 Starting hybrid creation. Cluster: {req.cluster_type or 'base'}")
     results = {'gcp': None, 'aws': None}
     errors = {'gcp': None, 'aws': None}
     
+    # Calculate node distribution if total_nodes is specified
+    if req.total_nodes and req.total_nodes > 0:
+        gcp_count = req.total_nodes // 2
+        aws_count = req.total_nodes - gcp_count
+        
+        # Override count in gcp and aws configs
+        if req.gcp:
+            req.gcp.count = gcp_count
+        if req.aws:
+            req.aws.min_count = aws_count
+            req.aws.max_count = aws_count
+        
+        log_to_telegram(f"📊 Node distribution: {gcp_count} GCP + {aws_count} AWS = {req.total_nodes} total")
+    
+    # Special handling for docker-swarm-manager (Tailscale VPN cluster)
+    if req.cluster_type == "docker-swarm-manager":
+        if not TAILSCALE_AUTH_KEY:
+            raise HTTPException(status_code=500, detail="TAILSCALE_AUTH_KEY not configured in environment")
+        
+        log_to_telegram(f"🔧 Creating Tailscale-based Docker Swarm cluster")
+        
+        # Step 1: Create manager (first GCP node)
+        if req.gcp:
+            try:
+                credentials_path = req.gcp.credentials or os.path.join(os.path.dirname(__file__), 'credentials.json')
+                creds = _set_credentials_and_load(credentials_path)
+                
+                # Prepare manager script with Tailscale key
+                manager_script = prepare_manager_script(STARTUP_SCRIPTS["docker-swarm-manager"], TAILSCALE_AUTH_KEY)
+                
+                log_to_telegram(f"📍 Creating Swarm manager on GCP: {req.gcp.name}")
+                
+                manager_result = create_instance(
+                    project_id=creds['project_id'],
+                    zone=req.gcp.zone,
+                    instance_name=req.gcp.name,
+                    machine_type=req.gcp.machine_type,
+                    ssh_key=req.gcp.ssh_key,
+                    password=getattr(req.gcp, 'password', None),
+                    count=1,  # Only 1 manager
+                    startup_script=manager_script
+                )
+                
+                results['gcp'] = manager_result
+                manager_ip = manager_result.get('public_ip')
+                manager_password = manager_result.get('password')
+                
+                log_to_telegram(f"⏳ Waiting for manager to initialize Swarm (this may take 2-3 minutes)...")
+                
+                # Step 2: Wait and retrieve swarm info via SSH
+                try:
+                    swarm_info = get_swarm_info_via_ssh(manager_ip, password=manager_password, max_retries=15)
+                    manager_vpn_ip = swarm_info['vpn_ip']
+                    worker_token = swarm_info['worker_token']
+                    
+                    log_to_telegram(f"✅ Manager ready! VPN IP: {manager_vpn_ip}")
+                    
+                    # Step 3: Create workers on AWS
+                    if req.aws and req.aws.min_count > 0:
+                        aws_creds = {}
+                        if getattr(req.aws, 'aws_access_key', None) or getattr(req.aws, 'aws_secret_key', None):
+                            aws_creds = {
+                                'aws_access_key': getattr(req.aws, 'aws_access_key', None),
+                                'aws_secret_key': getattr(req.aws, 'aws_secret_key', None),
+                                'aws_session_token': getattr(req.aws, 'aws_session_token', None),
+                                'region': req.aws.region
+                            }
+                        else:
+                            aws_creds = _load_aws_credentials_file()
+                        
+                        # Prepare worker script
+                        worker_script = prepare_worker_script(
+                            STARTUP_SCRIPTS["docker-swarm-worker"],
+                            TAILSCALE_AUTH_KEY,
+                            worker_token,
+                            manager_vpn_ip
+                        )
+                        
+                        log_to_telegram(f"📍 Creating {req.aws.min_count} Swarm workers on AWS")
+                        
+                        workers = create_instance_aws(
+                            region_name=req.aws.region or aws_creds.get('region') or 'us-west-2',
+                            image_id=getattr(req.aws, 'image_id', None) or 'ami-03c1f788292172a4e',
+                            instance_type=getattr(req.aws, 'instance_type', None) or 't3.micro',
+                            password=getattr(req.aws, 'password', None),
+                            name=getattr(req.aws, 'name', None),
+                            key_name=req.aws.key_name,
+                            security_group_ids=req.aws.security_group_ids,
+                            subnet_id=req.aws.subnet_id,
+                            min_count=req.aws.min_count,
+                            max_count=req.aws.max_count,
+                            aws_access_key=aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key'),
+                            aws_secret_key=aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key'),
+                            aws_session_token=aws_creds.get('aws_session_token'),
+                            user_data_script=worker_script
+                        )
+                        
+                        results['aws'] = {'success': True, 'created': workers}
+                        log_to_telegram(f"✅ Swarm cluster created! Manager: {manager_vpn_ip}, Workers: {len(workers)}")
+                    
+                except Exception as e:
+                    errors['gcp'] = f"Failed to retrieve swarm info: {e}"
+                    log_to_telegram(f"❌ Failed to get swarm info: {e}")
+                    
+            except Exception as e:
+                errors['gcp'] = str(e)
+                results['gcp'] = {'success': False}
+                log_to_telegram(f"❌ GCP manager creation failed: {e}")
+        
+        return {"results": results, "errors": errors}
+    
+    # Normal hybrid creation (non-Swarm)
     # GCP
     if req.gcp:
         try:
-            creds = _set_credentials_and_load(req.gcp.credentials)
+            credentials_path = req.gcp.credentials or os.path.join(os.path.dirname(__file__), 'credentials.json')
+            creds = _set_credentials_and_load(credentials_path)
             gcp_result = create_instance(
                 project_id=creds['project_id'],
                 zone=req.gcp.zone,
@@ -498,9 +894,53 @@ def api_all_create(req: AllCreateRequest):
                 startup_script=STARTUP_SCRIPTS.get(req.cluster_type) if req.cluster_type else None
             )
             results['gcp'] = gcp_result
+            if req.cluster_type and req.cluster_type in SERVICE_INFO:
+                if isinstance(gcp_result, dict) and "created" in gcp_result:
+                    for item in gcp_result["created"]:
+                        item["service_info"] = SERVICE_INFO[req.cluster_type]
+                elif isinstance(gcp_result, dict):
+                    gcp_result["service_info"] = SERVICE_INFO[req.cluster_type]
+            
+            # Enhanced Telegram logging for GCP
+            ports = SERVICE_INFO.get(req.cluster_type, {}).get('ports', []) if req.cluster_type else []
+            ports_str = ', '.join(map(str, ports)) if ports else 'N/A'
+            
+            if isinstance(gcp_result, dict):
+                # Check if it's a multiple instances response
+                if "created" in gcp_result and isinstance(gcp_result["created"], list):
+                    # Multiple instances
+                    for item in gcp_result["created"]:
+                        ip = item.get('public_ip', 'N/A')
+                        password = item.get('password', 'N/A')
+                        username = item.get('username', 'ubuntu')
+                        name = item.get('name', req.gcp.name)
+                        
+                        msg = f"✅ GCP Instance Created!\n"
+                        msg += f"Name: {name}\n"
+                        msg += f"IP: {ip}\n"
+                        msg += f"User: {username}\n"
+                        msg += f"Password: {password}\n"
+                        msg += f"Cluster: {req.cluster_type or 'base'}\n"
+                        msg += f"Ports: {ports_str}"
+                        log_to_telegram(msg)
+                else:
+                    # Single instance
+                    ip = gcp_result.get('public_ip', 'N/A')
+                    password = gcp_result.get('password', 'N/A')
+                    username = gcp_result.get('username', 'ubuntu')
+                    
+                    msg = f"✅ GCP Instance Created!\n"
+                    msg += f"Name: {req.gcp.name}\n"
+                    msg += f"IP: {ip}\n"
+                    msg += f"User: {username}\n"
+                    msg += f"Password: {password}\n"
+                    msg += f"Cluster: {req.cluster_type or 'base'}\n"
+                    msg += f"Ports: {ports_str}"
+                    log_to_telegram(msg)
         except Exception as e:
             errors['gcp'] = str(e)
             results['gcp'] = {'success': False}
+            log_to_telegram(f"❌ GCP creation failed: {e}")
 
     # AWS
     if req.aws:
@@ -535,9 +975,32 @@ def api_all_create(req: AllCreateRequest):
                 user_data_script=script
             )
             results['aws'] = {'success': True, 'created': ids}
+            if req.cluster_type and req.cluster_type in SERVICE_INFO:
+                for item in ids:
+                    item["service_info"] = SERVICE_INFO[req.cluster_type]
+            
+            # Enhanced Telegram logging for AWS
+            ports = SERVICE_INFO.get(req.cluster_type, {}).get('ports', []) if req.cluster_type else []
+            ports_str = ', '.join(map(str, ports)) if ports else 'N/A'
+            
+            for instance in ids:
+                ip = instance.get('PublicIpAddress', 'N/A')
+                password = instance.get('Password', 'N/A')
+                username = instance.get('username', 'ubuntu')
+                instance_id = instance.get('InstanceId', 'N/A')
+                
+                msg = f"✅ AWS Instance Created!\n"
+                msg += f"ID: {instance_id}\n"
+                msg += f"IP: {ip}\n"
+                msg += f"User: {username}\n"
+                msg += f"Password: {password}\n"
+                msg += f"Cluster: {req.cluster_type or 'base'}\n"
+                msg += f"Ports: {ports_str}"
+                log_to_telegram(msg)
         except Exception as e:
             errors['aws'] = str(e)
             results['aws'] = {'success': False}
+            log_to_telegram(f"❌ AWS creation failed: {e}")
 
     return {"results": results, "errors": errors}
 
@@ -585,6 +1048,7 @@ def api_all_list(req: AllListRequest):
 
 @app.post('/all/delete')
 def api_all_delete(req: AllDeleteRequest):
+    log_to_telegram("Starting hybrid deletion")
     results = {'gcp': None, 'aws': None}
     errors = {'gcp': None, 'aws': None}
     # GCP delete
@@ -597,9 +1061,11 @@ def api_all_delete(req: AllDeleteRequest):
             else:
                 ok = find_and_delete_instance(project_id=creds['project_id'], instance_name=req.gcp_name)
             results['gcp'] = {'success': bool(ok)}
+            log_to_telegram(f"Hybrid GCP delete: {req.gcp_name} (Success: {ok})")
     except Exception as e:
         errors['gcp'] = str(e)
         results['gcp'] = {'success': False}
+        log_to_telegram(f"Hybrid GCP delete error: {e}")
     # AWS delete
     try:
         if req.aws_access_key or req.aws_secret_key or req.aws_session_token:
@@ -616,9 +1082,11 @@ def api_all_delete(req: AllDeleteRequest):
         res = delete_instance_aws(instance_id=req.aws_instance_id, name=req.aws_name, region_name=aws_region,
                                   aws_access_key=aws_access_key, aws_secret_key=aws_secret_key, aws_session_token=aws_session_token)
         results['aws'] = res
+        log_to_telegram(f"Hybrid AWS delete: {req.aws_instance_id or req.aws_name} (Result: {res})")
     except Exception as e:
         errors['aws'] = str(e)
         results['aws'] = {'success': False}
+        log_to_telegram(f"Hybrid AWS delete error: {e}")
     return {"results": results, "errors": errors}
 
 @app.post('/all/find')
@@ -661,10 +1129,12 @@ def api_all_find(req: AllFindRequest):
 
 @app.post('/action/start')
 def api_action_start(req: ActionRequest):
+    log_to_telegram(f"Starting instance: {req.id} ({req.provider})")
     try:
         if req.provider == 'gcp':
             creds = _set_credentials_and_load(req.credentials or './credentials.json')
             start_instance_gcp(creds['project_id'], req.zone, req.id)
+            log_to_telegram(f"GCP instance started: {req.id}")
             return {"success": True}
         elif req.provider == 'aws':
             aws_creds = {}
@@ -677,16 +1147,22 @@ def api_action_start(req: ActionRequest):
                                aws_access_key=aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key'),
                                aws_secret_key=aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key'),
                                aws_session_token=aws_creds.get('aws_session_token'))
+            log_to_telegram(f"AWS instance started: {req.id}")
             return {"success": True}
     except Exception as e:
+        log_to_telegram(f"Error starting instance {req.id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/action/stop')
 def api_action_stop(req: ActionRequest):
+    log_to_telegram(f"Stopping instance: {req.id} ({req.provider})")
     try:
         if req.provider == 'gcp':
+            if not req.zone:
+                raise HTTPException(status_code=400, detail="Zone is required for GCP stop action")
             creds = _set_credentials_and_load(req.credentials or './credentials.json')
             stop_instance_gcp(creds['project_id'], req.zone, req.id)
+            log_to_telegram(f"GCP instance stopped: {req.id}")
             return {"success": True}
         elif req.provider == 'aws':
             aws_creds = {}
@@ -699,9 +1175,97 @@ def api_action_stop(req: ActionRequest):
                                aws_access_key=aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key'),
                                aws_secret_key=aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key'),
                                aws_session_token=aws_creds.get('aws_session_token'))
+            log_to_telegram(f"AWS instance stopped: {req.id}")
             return {"success": True}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        log_to_telegram(f"Error stopping instance {req.id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/telegram/webhook')
+async def telegram_webhook(request: dict):
+    """Handle Telegram bot commands"""
+    try:
+        # Extract message info
+        message = request.get('message', {})
+        chat_id = message.get('chat', {}).get('id')
+        text = message.get('text', '')
+        
+        if not chat_id or not text:
+            return {"ok": True}
+        
+        # Handle commands
+        if text == '/start':
+            response_text = "👋 Welcome to Cloud Instance Manager Bot!\n\nCommands:\n/list - Show all running instances"
+            _send_telegram_message(chat_id, response_text)
+        
+        elif text == '/list':
+            # Get GCP instances
+            gcp_instances = []
+            aws_instances = []
+            
+            try:
+                credentials_path = os.path.join(os.path.dirname(__file__), 'credentials.json')
+                creds = _set_credentials_and_load(credentials_path)
+                gcp_instances = list_instances(project_id=creds['project_id'])
+            except Exception as e:
+                print(f"Error listing GCP: {e}")
+            
+            try:
+                aws_creds = _load_aws_credentials_file()
+                aws_instances = list_instances_aws(
+                    region_name=aws_creds.get('region', 'us-west-2'),
+                    aws_access_key=aws_creds.get('aws_access_key_id') or aws_creds.get('aws_access_key'),
+                    aws_secret_key=aws_creds.get('aws_secret_access_key') or aws_creds.get('aws_secret_key'),
+                    aws_session_token=aws_creds.get('aws_session_token')
+                )
+            except Exception as e:
+                print(f"Error listing AWS: {e}")
+            
+            # Format response
+            response_text = "📊 **Active Instances**\n\n"
+            
+            if gcp_instances:
+                response_text += "**GCP:**\n"
+                for inst in gcp_instances[:10]:  # Limit to 10
+                    name = inst.get('name', 'N/A')
+                    status = inst.get('status', 'N/A')
+                    ip = inst.get('public_ip', 'N/A')
+                    response_text += f"• {name} - {status}\n  IP: {ip}\n"
+                response_text += "\n"
+            
+            if aws_instances:
+                response_text += "**AWS:**\n"
+                for inst in aws_instances[:10]:  # Limit to 10
+                    name = inst.get('Name', 'N/A')
+                    status = inst.get('State', 'N/A')
+                    ip = inst.get('PublicIpAddress', 'N/A')
+                    response_text += f"• {name} - {status}\n  IP: {ip}\n"
+            
+            if not gcp_instances and not aws_instances:
+                response_text += "No active instances found."
+            
+            _send_telegram_message(chat_id, response_text)
+        
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error in telegram webhook: {e}")
+        return {"ok": False, "error": str(e)}
+
+def _send_telegram_message(chat_id: int, text: str):
+    """Send a message to a specific Telegram chat"""
+    if not TELEGRAM_BOT_TOKEN:
+        print(f"Cannot send message, bot token not configured: {text}")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Failed to send Telegram message: {e}")
 
 def main():
     parser = argparse.ArgumentParser(

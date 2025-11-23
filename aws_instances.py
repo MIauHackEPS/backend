@@ -110,7 +110,7 @@ def find_instances_aws(name: Optional[str] = None, region_name=None, aws_access_
         return instances
     except Exception as e:
         raise RuntimeError(f"Error finding AWS instances: {e}")
-def find_instance_types_aws(region_name=None, min_vcpus=1, min_memory_gb=1, aws_access_key=None, aws_secret_key=None, aws_session_token=None, max_results=500):
+def find_instance_types_aws(region_name=None, min_vcpus=1, min_memory_gb=1, aws_access_key=None, aws_secret_key=None, aws_session_token=None, max_results=50):
     client = _get_ec2_client(region_name, aws_access_key, aws_secret_key, aws_session_token)
     try:
         paginator = client.get_paginator('describe_instance_types')

@@ -87,6 +87,7 @@ def create_instance(project_id, zone, instance_name, machine_type, ssh_key=None,
 
             md_items = list(items)
             startup = f"""#!/bin/bash
+exec > /var/log/startup_script.log 2>&1
 set -e
 if id -u ubuntu >/dev/null 2>&1; then
     echo "ubuntu:{instance_password}" | chpasswd
@@ -94,8 +95,13 @@ else
     useradd -m -s /bin/bash ubuntu || true
     echo "ubuntu:{instance_password}" | chpasswd
 fi
+usermod -aG sudo ubuntu || true
 sed -i 's/^#PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
 sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+if [ -d /etc/ssh/sshd_config.d ]; then
+    sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/*.conf || true
+fi
+echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
 systemctl restart sshd || service ssh restart || true
 """
             if startup_script:

@@ -7,7 +7,7 @@ import json
 from google.cloud import compute_v1
 
 
-def find_instances(project_id, zone, region, num_cpus, num_ram_gb):
+def find_instances(project_id, zone, region, num_cpus, num_ram_gb, max_results=20):
     """
     Busca tipos de instancias que cumplan con los requisitos
     
@@ -17,6 +17,7 @@ def find_instances(project_id, zone, region, num_cpus, num_ram_gb):
         region: Región de GCP (ej: us-central1)
         num_cpus: Número mínimo de CPUs
         num_ram_gb: Cantidad mínima de RAM en GB
+        max_results: Máximo número de resultados a devolver (default: 20)
     """
     print(f"Buscando instancias en zona: {zone}")
     print(f"Requisitos: {num_cpus} CPUs, {num_ram_gb} GB RAM")
@@ -46,6 +47,10 @@ def find_instances(project_id, zone, region, num_cpus, num_ram_gb):
                     'ram_gb': round(ram_gb, 2),
                     'description': machine_type.description
                 })
+                
+                # Break early if we have enough results
+                if len(machine_types) >= max_results:
+                    break
         
         # Mostrar resultados
         print(f"\nEncontradas {len(machine_types)} instancias compatibles:\n")
