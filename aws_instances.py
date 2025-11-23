@@ -80,6 +80,12 @@ def list_instances_aws(region_name=None, aws_access_key=None, aws_secret_key=Non
                     t = inst.get('InstanceType')
                     if t and t in type_map:
                         inst.update(type_map[t])
+                        # Add common alias keys for frontend compatibility
+                        if type_map[t].get('vcpus') is not None:
+                            inst['cpus'] = type_map[t].get('vcpus')
+                        if type_map[t].get('memory_gb') is not None:
+                            inst['ram_gb'] = type_map[t].get('memory_gb')
+                            inst['ram'] = type_map[t].get('memory_gb')
         except Exception:
             # If describing instance types fails, return instances without vcpu/memory enrichment
             pass
@@ -125,6 +131,11 @@ def list_instances_aws_all(region_name=None, aws_access_key=None, aws_secret_key
                     t = inst.get('InstanceType')
                     if t and t in type_map:
                         inst.update(type_map[t])
+                        if type_map[t].get('vcpus') is not None:
+                            inst['cpus'] = type_map[t].get('vcpus')
+                        if type_map[t].get('memory_gb') is not None:
+                            inst['ram_gb'] = type_map[t].get('memory_gb')
+                            inst['ram'] = type_map[t].get('memory_gb')
         except Exception:
             pass
 
@@ -182,6 +193,11 @@ def find_instances_aws(name: Optional[str] = None, region_name=None, aws_access_
                     t = inst.get('InstanceType')
                     if t and t in type_map:
                         inst.update(type_map[t])
+                        if type_map[t].get('vcpus') is not None:
+                            inst['cpus'] = type_map[t].get('vcpus')
+                        if type_map[t].get('memory_gb') is not None:
+                            inst['ram_gb'] = type_map[t].get('memory_gb')
+                            inst['ram'] = type_map[t].get('memory_gb')
         except Exception:
             pass
 
